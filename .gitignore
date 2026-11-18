@@ -1,0 +1,80 @@
+# ===================================================================
+# FinTrack Monorepo Root .gitignore
+# ===================================================================
+
+# ── Environment & Secret Files (ZERO-LEAK GUARANTEE) ───────────────
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.k8s.example
+
+# ── Node / JavaScript / Mobile ─────────────────────────────────────
+node_modules/
+**/node_modules/
+.expo/
+**/.expo/
+dist/
+**/dist/
+web-build/
+**/web-build/
+expo-env.d.ts
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.tsbuildinfo
+mobile/ios/
+mobile/android/
+expense_tracker/ios/
+expense_tracker/android/
+
+# ── Java / Spring Boot / Maven / Gradle ────────────────────────────
+**/.gradle/
+**/build/
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+**/src/main/resources/application-*.yaml
+!**/src/main/resources/application.yaml
+
+# ── Python / FastAPI ───────────────────────────────────────────────
+**/venv/
+venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+
+# ── Keystores & Certificates ───────────────────────────────────────
+*.jks
+*.p8
+*.p12
+*.key
+*.pem
+*.mobileprovision
+
+# ── IDEs & Editors ─────────────────────────────────────────────────
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+*.iml
+*.iws
+*.ipr
+
+# ── Logs & Diagnostics ─────────────────────────────────────────────
+**/logs/
+*.log
+*.sqlite
+*.db
+
+# ── Operating System Junk ──────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

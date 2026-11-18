@@ -1,0 +1,1331 @@
+# FinTrack Microservices Backend
+
+> A distributed, event-driven financial management and expense tracking platform built with **Spring Boot 3**, **Java 21**, **Python 3.12 (FastAPI)**, **Google Gemini 2.5 Flash**, **Apache Kafka**, **PostgreSQL**, and **Redis**. Designed for high throughput, strict transactional consistency, and enterprise-grade resilience against distributed systems failure modes.
+
+---
+
+
+## 👤 User Service (`userService`)
+
+The **User Service** manages user identity lifecycle, profiles, authorization metadata, and media asset storage. It acts as the source of truth for user accounts across the ecosystem, integrating asynchronously with `AuthService`, `ExpenseService`, and `NotificationService`.
+
+---
+
+### 🏛️ Architectural Overview & Distributed Patterns
+
+```mermaid
+graph TD
+    subgraph Client / Gateway
+        Client([HTTP Client / Gateway])
+    end
+
+    subgraph User Service
+        Controller[UserController]
+        Service[UserService / UserWriteService]
+        Domain[UserDomainService]
+        LockMgr[UserLockManager<br/>Redisson Distributed Lock]
+        OutboxPoller[UserDeletedProducer<br/>Outbox Poller]
+        Consumer[AuthServiceConsumer]
+        DltConsumer[UserDltConsumer]
+    end
+
+    subgraph Persistence Layer
+        DB[(PostgreSQL 16<br/>Flyway Managed)]
+        Redis[(Redis 7<br/>Distributed Locks)]
+    end
+
+    subgraph Messaging Layer
+        KafkaTopic[[user.events]]
+        KafkaDlt[[user.events.DLT]]
+        KafkaDeleted[[user.deleted]]
+    end
+
+    subgraph External
+        Cloudinary[(Cloudinary CDN<br/>Avatar Media)]
+    end
+
+    Client -->|JWT Authenticated REST| Controller
+    Controller --> LockMgr
+    LockMgr -->|Acquire user:lock:id| Redis
+    LockMgr --> Service
+    Service --> Domain
+    Service -->|Save User & Outbox Event| DB
+    Service -->|HTTP Upload outside DB TX| Cloudinary
+
+    OutboxPoller -->|FOR UPDATE SKIP LOCKED| DB
+    OutboxPoller -->|Publish with Backoff| KafkaDeleted
+
+    KafkaTopic --> Consumer
+    Consumer -->|Idempotency Check processed_events| DB
+    Consumer --> LockMgr
+
+    KafkaTopic -.->|Non-retryable / Corrupt| KafkaDlt
+    KafkaDlt --> DltConsumer
+    DltConsumer -->|Save to failed_events| DB
+```
+
+---
+
+### 🛡️ Core Engineering Highlights & Resiliency Patterns
+
+#### 1. Transactional Outbox Pattern with PostgreSQL `SKIP LOCKED` Worker Leasing
+- **The Problem Solved**: The dual-write problem. Deleting a user must notify downstream services (`expenseService`, `notificationService`, `authService`) via Kafka without risking ghost events or lost deletions.
+- **Implementation**:
+  - User deletion and outbox event persistence happen in the **exact same database transaction**.
+  - Background worker leases unpublished events using `SELECT * FROM outbox_events WHERE ... FOR UPDATE SKIP LOCKED LIMIT 10`.
+  - Multiple worker instances or pods process disjoint batches concurrently with zero row contention or locking bottlenecks.
+  - Implements **exponential backoff** (`1s, 2s, 4s...`) on transient Kafka failures and dead-letters events after 10 failed attempts to `DEAD` status.
+  - Includes `OutboxAdminService.reviveEvent(...)` for operational recovery.
+
+#### 2. Distributed Locking with Redisson (`UserLockManager`)
+- **The Problem Solved**: Eliminates race conditions, lost updates, and phantom reads when concurrent requests or duplicate Kafka events attempt to mutate the same user record.
+- **Implementation**:
+  - Employs Redis-backed distributed locks keyed on `user:lock:{userId}` with a 5-second acquisition timeout.
+  - **Lock -> Transaction -> Commit -> Unlock ordering**: Guarantees that PostgreSQL connections are never held while waiting for distributed locks, eliminating HikariCP connection pool starvation.
+
+#### 3. Zero-Message-Loss Consumer Idempotency
+- **The Problem Solved**: Guarantees exactly-once processing semantics over Kafka’s at-least-once transport.
+- **Implementation**:
+  - `AuthServiceConsumer` checks the `processed_events` table before applying events.
+  - Re-delivered or duplicate events (e.g. from broker rebalances or network retries) are recognized and skipped cleanly without throwing database constraint errors.
+
+#### 4. Poison Pill Resilient Dead Letter Topic (DLT) Pipeline
+- **The Problem Solved**: Corrupted, truncated, or malformed JSON payloads cannot crash consumers or block partition processing (head-of-line blocking).
+- **Implementation**:
+  - Configured with `DefaultErrorHandler` and a `DeadLetterPublishingRecoverer`.
+  - Non-retryable exceptions (`IllegalArgumentException`, deserialization errors) are immediately forwarded to `user.events.DLT`.
+  - `UserDltConsumer` uses a dedicated `dltKafkaListenerContainerFactory` with a plain `StringDeserializer` and `CommonLoggingErrorHandler`. This prevents deserialization crashes on poison pills and eliminates recursive `.DLT.DLT` infinite republishing loops.
+  - Captures failed payloads, stack traces, and metadata into the `failed_events` audit table with automatic string truncation.
+
+#### 5. Connection-Pool Safe External I/O
+- Profile image uploads to Cloudinary run **outside** active database transaction boundaries.
+- Database connections from HikariCP are borrowed only for the subsequent 1–2 millisecond `save` operation, preventing pool exhaustion under slow external network conditions.
+- Automatic compensating transaction deletes orphaned Cloudinary assets if the database save fails.
+
+---
+
+### 🔌 REST API Specification
+
+Base Path: `/api/v1/users`
+
+| Method | Endpoint | Access Control | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/users` | `ADMIN` or Self (`#request.userId == authentication.name`) | Creates a new user profile. |
+| `GET` | `/api/v1/users/{userId}` | `ADMIN` or Self (`#userId == authentication.name`) | Retrieves profile by user ID. |
+| `GET` | `/api/v1/users/emails/{email}` | `ADMIN` only | Looks up user profile by email address. |
+| `PUT` | `/api/v1/users/{userId}` | `ADMIN` or Self (`#userId == authentication.name`) | Updates user details with conflict validation. |
+| `DELETE` | `/api/v1/users/{userId}` | `ADMIN` or Self (`#userId == authentication.name`) | Deletes user & publishes transactional outbox event. |
+| `PATCH` | `/api/v1/users/{userId}/profile-image` | `ADMIN` or Self (`#userId == authentication.name`) | Uploads avatar (Multipart: JPEG/PNG/WebP, <= 5MB). |
+| `POST` | `/api/v1/users/admin/outbox/{eventId}/revive` | `ADMIN` only | Revives a `DEAD` outbox event for re-polling. |
+
+---
+
+### 🗄️ Database Schema & Flyway Migrations
+
+The database is version-controlled via Flyway with strict DDL validation (`spring.jpa.hibernate.ddl-auto=validate`):
+
+- **`V1__init_users_and_outbox.sql`**: Initial schema for `users` and `outbox_events` with partial index on unpublished events.
+- **`V2__outbox_add_retry_fields.sql`**: Adds `attempt_count`, `next_retry_at`, `last_error`, `status` enum, and composite poller index.
+- **`V3__processed_events.sql`**: Creates `processed_events` idempotency table scoped by consumer group.
+- **`V4__failed_events.sql`**: Creates `failed_events` audit store for dead-lettered poison pill records.
+- **`V5__phone_number_to_varchar_and_outbox_locked_until.sql`**: Migrates `phone_number` to international `VARCHAR(20)` format and adds lease column `locked_until` with index `idx_outbox_claimable`.
+
+---
+
+### 🧪 Comprehensive Integration & Chaos Testing Suite
+
+The `userService` test suite incorporates **100+ tests** covering unit, controller, slice, and full distributed integration testing:
+
+```bash
+userService/src/test/java/sagar/userService/
+├── integration/
+│   ├── FlywayMigrationIntegrationTest.java        # Validates V1-V5 migration scripts on real PostgreSQL container
+│   ├── OutboxConcurrencyIntegrationTest.java      # Multi-threaded SKIP LOCKED lease validation & crash recovery
+│   ├── AuthServiceConsumerIntegrationTest.java    # At-least-once Kafka deduplication & idempotency verification
+│   ├── UserDltIntegrationTest.java                # Poison pill routing & failed_events persistence
+│   ├── OutboxPublisherIntegrationTest.java        # Outbox state machine, exponential backoff & dead-lettering
+│   └── UserConcurrencyIntegrationTest.java        # Multi-threaded Redisson distributed lock contention & race conditions
+```
+
+#### Running the Test Suite:
+```bash
+# Navigate to service directory
+cd userService
+
+# Run unit & mock tests (Windows: .\gradlew.bat test)
+./gradlew test
+
+# Run all integration tests (requires Docker daemon for Testcontainers)
+./gradlew test --tests *IntegrationTest*
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | HTTP port | `9001` |
+| `POSTGRES_HOST` | PostgreSQL Host | `localhost` |
+| `POSTGRES_PORT` | PostgreSQL Port | `5432` |
+| `POSTGRES_DB` | Database Name | `userservice` |
+| `POSTGRES_USER` | Database Username | - |
+| `POSTGRES_PASSWORD` | Database Password | - |
+| `REDIS_HOST` | Redis Host for Distributed Locking | `localhost` |
+| `REDIS_PORT` | Redis Port | `6379` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka Broker addresses | `localhost:9092` |
+| `JWT_SECRET` | HMAC Secret Key for JWT Token Validation | - |
+| `CLOUDINARY_CLOUD_NAME` | Cloudinary Account Cloud Name | - |
+| `CLOUDINARY_API_KEY` | Cloudinary API Key | - |
+| `CLOUDINARY_API_SECRET` | Cloudinary API Secret | - |
+| `EUREKA_URI` | Service Discovery Server URI | `http://localhost:8761/eureka/` |
+| `ZIPKIN_ENDPOINT` | Distributed Tracing Ingestion Endpoint | `http://localhost:9411/api/v2/spans` |
+
+
+---
+
+## 🔐 Authentication Service (`AuthService1`)
+
+The **Authentication Service** manages identity issuance, credential verification, cryptographic refresh token lifecycles, role-based access control (RBAC), and transactional user provisioning. It functions as the central OAuth2-style token issuer and authentication authority for the FinTrack microservices ecosystem.
+
+---
+
+### 🏛️ Architectural Overview & Distributed Patterns
+
+```mermaid
+graph TD
+    subgraph Client / Gateway
+        Client([HTTP Client / Gateway])
+    end
+
+    subgraph Authentication Service
+        SecurityFilter[SecurityFilterChain<br/>JwtAuthFilter]
+        AuthController[AuthController]
+        TokenController[TokenController]
+        AdminController[AdminController]
+        UserDetailsService[UserDetailsServiceImpl]
+        RefreshTokenSvc[RefreshTokenService]
+        AdminSvc[AdminService]
+        CleanupSvc[UserCleanupService]
+        Consumer[UserDeletedConsumer]
+        OutboxPoller[UserInfoProducer<br/>Outbox Poller]
+        OutboxPublisher[OutboxEventPublisher]
+    end
+
+    subgraph Persistence Layer
+        DB[(PostgreSQL 16<br/>Flyway Managed)]
+    end
+
+    subgraph Messaging Layer
+        KafkaEvents[[user.events]]
+        KafkaDeleted[[user.deleted]]
+        KafkaDlt[[user.deleted.DLT]]
+    end
+
+    subgraph External Services
+        Brevo[(Brevo HTTP API<br/>Transactional Password Emails)]
+    end
+
+    Client -->|Public / Secured REST| SecurityFilter
+    SecurityFilter --> AuthController
+    SecurityFilter --> TokenController
+    SecurityFilter --> AdminController
+
+    AuthController --> UserDetailsService
+    AuthController --> RefreshTokenSvc
+    TokenController --> RefreshTokenSvc
+    TokenController --> UserDetailsService
+    AdminController --> AdminSvc
+
+    UserDetailsService -->|Atomic Save User & Outbox Event| DB
+    UserDetailsService -.->|Send Reset Link Outside DB TX| Brevo
+    RefreshTokenSvc -->|Save SHA-256 Hashed Tokens| DB
+
+    OutboxPoller -->|FOR UPDATE SKIP LOCKED| DB
+    OutboxPoller --> OutboxPublisher
+    OutboxPublisher -->|Publish with Exponential Backoff| KafkaEvents
+
+    KafkaDeleted --> Consumer
+    Consumer --> CleanupSvc
+    CleanupSvc -->|Cascade Delete User, Tokens, Resets| DB
+    KafkaDeleted -.->|Non-retryable / Poison Pill| KafkaDlt
+```
+
+---
+
+### 🛡️ Core Engineering Highlights & Resiliency Patterns
+
+#### 1. Cryptographic Single-Use Refresh Token Rotation & SHA-256 Hashing
+- **The Problem Solved**: Refresh token theft, token replay attacks, and database breach exposure. Storing plaintext refresh tokens in a database allows attackers with read-access to compromise user sessions indefinitely.
+- **Implementation**:
+  - The client receives a high-entropy raw UUID token. The database stores **only** the salted SHA-256 hexadecimal hash (`tokens.token_hash`, 64 characters).
+  - Implements **Single-Use Token Rotation (STR)**: Rotating a refresh token atomically revokes and purges the old token hash and issues a brand-new token pair.
+  - **Replay Attack Defense**: Presenting an already-rotated token returns `401 Unauthorized` immediately.
+  - **Optimistic Concurrency & Double-Spend Defense**: Concurrent requests presenting the identical token simultaneously collide on database deletion; one request succeeds (`200 OK`) and the concurrent duplicate is caught and translated to `409 Conflict` / `401 Unauthorized`.
+
+#### 2. Transactional Outbox Pattern with `FOR UPDATE SKIP LOCKED` Worker Leasing
+- **The Problem Solved**: The dual-write problem during account signup. Saving a user to the database while publishing an event to Kafka in separate operations risks orphan accounts or lost events upon broker failures.
+- **Implementation**:
+  - User creation and `USER_CREATED` outbox event persistence occur within the **exact same database transaction**.
+  - Background worker (`UserInfoProducer`) leases pending events using `SELECT * FROM outbox_events WHERE ... FOR UPDATE SKIP LOCKED LIMIT 10` with a 30-second lease lock (`locked_until`).
+  - Implements **exponential backoff** (`1s, 2s, 4s...` capped at `5m`) on transient Kafka failures and dead-letters events after 10 failed attempts (`DEAD` status) with truncated error tracking.
+
+#### 3. Anti-Enumeration & Session-Revocation Password Reset Flow
+- **The Problem Solved**: Account enumeration attacks and active session persistence after credential compromise.
+- **Implementation**:
+  - Calling `/auth/v1/forgot-password` with an unregistered email returns `200 OK ("Password reset email sent")` without leaking account existence.
+  - Tokens expire after 15 minutes, are single-use, and are stored only as SHA-256 hashes.
+  - **Complete Session Invalidation**: Successfully resetting a password immediately wipes **all active refresh tokens** for that user across every mobile and web device, forcing full re-authentication.
+
+#### 4. Spring Security 6 & Stateless JWT Architecture
+- **The Problem Solved**: Secure token parsing without database lookups across downstream microservices.
+- **Implementation**:
+  - Stateless architecture (`SessionCreationPolicy.STATELESS`) with a customized `JwtAuthFilter`.
+  - Spring Security's internal `UserDetails` model is cleanly isolated within `AuthService1` (`CustomUserDetails`).
+  - Downstream services (`userService`, `expenseService`, `gateway`) validate raw JWT signature claims independently without coupling to `AuthService1`'s internal persistence entities.
+
+#### 5. Cascading Relational Event-Driven Cleanup (`user.deleted`)
+- **The Problem Solved**: Eliminating orphaned credentials and tokens when a user account is deleted by the `userService`.
+- **Implementation**:
+  - `UserDeletedConsumer` consumes `user.deleted` and executes an atomic cascading purge across `RefreshToken`, `PasswordResetToken`, and `UserInfo`.
+  - Fully idempotent: duplicate Kafka messages exit gracefully without throwing constraint or not-found exceptions.
+  - Includes daily background housekeeping (`cleanupExpiredPasswordTokens`) to prune stale reset tokens.
+
+#### 6. Resilient Kafka Dead-Letter-Topic (DLT) Pipeline
+- **The Problem Solved**: Malformed or unparseable payloads (poison pills) blocking partition consumption.
+- **Implementation**:
+  - Configured with `DefaultErrorHandler` and a `DeadLetterPublishingRecoverer` routing unrecoverable records to `user.deleted.DLT`.
+  - Employs `ErrorHandlingDeserializer` to trap deserialization errors before reaching consumer business logic.
+
+---
+
+### 🔌 REST API Specification
+
+Base Path: `/auth/v1`
+
+| Method | Endpoint | Access Control | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/auth/v1/signup` | Public | Registers a new user, persists atomic outbox event, and returns access/refresh tokens. |
+| `POST` | `/auth/v1/login` | Public | Authenticates username & password; returns JWT access token and refresh token. |
+| `POST` | `/auth/v1/refreshToken` | Public | Rotates single-use refresh token; invalidates old token and returns new token pair. |
+| `POST` | `/auth/v1/forgot-password` | Public | Anti-enumeration password reset dispatch; generates hashed token & emails reset link. |
+| `POST` | `/auth/v1/reset-password` | Public | Verifies token, updates password, marks token used, and revokes all active sessions. |
+| `POST` | `/auth/v1/change/passwords`| Authenticated | Updates account password and invalidates active refresh tokens. |
+| `POST` | `/auth/v1/change/username` | Authenticated | Updates username and issues refreshed JWT token. |
+| `GET`  | `/auth/v1/ping` | Authenticated | Verifies authentication token and returns authenticated `userId`. |
+| `GET`  | `/auth/v1/health` | Public | Liveness probe returning service status and timestamp. |
+| `POST` | `/auth/v1/admin/users/{userId}/promote` | `ROLE_ADMIN` | Promotes target user to administrator (`204 No Content`). |
+| `DELETE`| `/auth/v1/admin/users/{userId}/admin` | `ROLE_ADMIN` | Demotes admin user and immediately revokes all their active sessions. |
+
+---
+
+### 🗄️ Database Schema & Flyway Migrations
+
+The database is version-controlled via Flyway with strict DDL validation (`spring.jpa.hibernate.ddl-auto=validate`):
+
+- **`V1__init_auth.sql`**: Initial schema for `users`, `user_roles` (element collection join table with foreign-key cascade), `tokens` (refresh tokens), and `outbox_events`.
+- **`V2__outbox_add_retry_fields.sql`**: Adds transactional outbox retry tracking columns (`attempt_count`, `next_retry_at`, `last_error`, `status`).
+- **`V3__reset_pass_token.sql`**: Creates `password_reset_tokens` table with foreign-key cascade and index on token hash.
+- **`V4__allow_multiple_tokens_per_user.sql`**: Drops unique constraint on `tokens.user_id` to support concurrent multi-device logins.
+- **`V5__outbox_add_locked_until.sql`**: Adds `locked_until` column and `idx_outbox_claimable` index for non-blocking worker leasing.
+
+---
+
+### 🧪 Comprehensive Integration & Concurrency Testing Suite
+
+The `AuthService1` test suite incorporates **120+ unit tests** and **21 PBC-grade integration tests** covering security guards, replay attacks, race conditions, and event cleanup:
+
+```bash
+AuthService1/app/src/test/java/org/example/
+├── integration/
+│   ├── SignupIntegrationTest.java           # Atomic outbox write & duplicate username conflict guards
+│   ├── RefreshTokenIntegrationTest.java      # Single-use rotation, SHA-256 DB verification, replay defense & 2-thread starter-pistol race test
+│   ├── PasswordResetIntegrationTest.java     # Anti-enumeration, email interception with ArgumentCaptor, password update & session wipe
+│   ├── AdminSecurityIntegrationTest.java     # RBAC enforcement, 401/403 rejection, admin promotion/demotion & session termination
+│   └── UserCleanupIntegrationTest.java       # user.deleted consumer cascade deletion, idempotency & token housekeeping
+```
+
+#### Running the Test Suite:
+```bash
+# Navigate to service directory
+cd AuthService1
+
+# Run all unit tests (Windows: .\gradlew.bat test)
+./gradlew test
+
+# Run all integration test suites
+./gradlew test --tests org.example.integration.* --no-daemon
+
+# Run specific integration test suite
+./gradlew test --tests org.example.integration.RefreshTokenIntegrationTest --no-daemon
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | HTTP port | `9898` |
+| `POSTGRES_HOST` | PostgreSQL Host | `localhost` |
+| `POSTGRES_PORT` | PostgreSQL Port | `5432` |
+| `POSTGRES_DB` | Database Name | `authservice` |
+| `POSTGRES_USER` | Database Username | - |
+| `POSTGRES_PASSWORD` | Database Password | - |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka Broker addresses | `localhost:9092` |
+| `JWT_SECRET` | Base64-encoded HMAC-SHA256 Secret (>= 256 bits) | - |
+| `JWT_EXPIRATION` | Access token lifespan (ms) | `3600000` (1 hour) |
+| `JWT_REFRESH_EXPIRATION`| Refresh token lifespan (ms) | `604800000` (7 days) |
+| `BREVO_API_KEY` | Brevo (Sendinblue) Transactional Email API Key | - |
+| `BREVO_SENDER_EMAIL` | Originating email address | `noreply@expensetracker.com` |
+| `BREVO_SENDER_NAME` | Originating sender name | `Expense Tracker` |
+| `EUREKA_URI` | Service Discovery Server URI | `http://localhost:8761/eureka/` |
+| `ZIPKIN_ENDPOINT` | Distributed Tracing Ingestion Endpoint | `http://localhost:9411/api/v2/spans` |
+
+---
+
+## 🌐 API Gateway (`gateway`)
+
+The **API Gateway** acts as the high-throughput, non-blocking edge reverse proxy and security perimeter for the FinTrack microservices ecosystem. Built on **Spring Cloud Gateway (Spring Boot 3.5.5, Java 21)** with **Project Reactor** and **Netty**, it performs non-blocking cryptographic JWT authentication, RBAC authorization, anti-spoofing header cleansing, distributed Redis rate limiting, Resilience4j circuit breaking, and distributed trace propagation.
+
+---
+
+### 🏛️ Architectural Overview & Filter Pipeline
+
+```mermaid
+graph TD
+    Client([Client Request]) --> Netty[Netty Reactive Non-Blocking Server]
+    Netty --> TraceFilter[TraceIdResponseFilter<br/>Injects X-Trace-Id beforeCommit]
+    TraceFilter --> JwtFilter{JwtAuthFilter<br/>Path matching & JWT Verification}
+
+    JwtFilter -->|Public Endpoint /auth/v1/login...| RouteMatch
+    JwtFilter -->|Missing or Invalid JWT| Err401[401 Unauthorized<br/>RFC-Compliant JSON]
+    JwtFilter -->|Non-Admin on /admin/**| Err403[403 Forbidden<br/>Admin Role Required]
+    
+    JwtFilter -->|Valid JWT| StripHeaders[Strip Inbound X-User-Id, X-Roles<br/>Inject Verified Claims & set exchange attribute]
+    StripHeaders --> RouteMatch[GatewayRoutesConfig<br/>Route Matcher & Method Filters]
+
+    RouteMatch --> RateLimiter{Redis Token Bucket<br/>UserKeyResolver}
+    RateLimiter -->|Rate Limit Exceeded| Err429[429 Too Many Requests]
+    RateLimiter -->|Tokens Available| CircuitBreaker{Resilience4j Circuit Breaker<br/>Per-Service Sliding Window}
+
+    CircuitBreaker -->|Circuit OPEN or Timed Out| Fallback[FallbackController<br/>503 Service Unavailable]
+    CircuitBreaker -->|Circuit CLOSED / Permitted| Downstream[Eureka LoadBalancer<br/>lb://SERVICE-NAME]
+
+    Downstream --> AuthSvc[AuthService1]
+    Downstream --> UserSvc[UserService]
+    Downstream --> ExpenseSvc[ExpenseService]
+    Downstream --> NotifSvc[NotificationService]
+    Downstream --> AISvc[AIService]
+```
+
+---
+
+### 🛡️ Core Security & Engineering Highlights
+
+#### 1. Zero-Trust Inbound Header Sanitization & Anti-Spoofing
+- **The Problem Solved**: Attackers could forge downstream identity headers (`X-User-Id`, `X-Username`, `X-Roles: ROLE_ADMIN`) to elevate privileges or impersonate arbitrary accounts.
+- **Implementation**:
+  - `JwtAuthFilter` unconditionally mutates the inbound request to strip client-supplied identity headers:
+    ```java
+    httpHeaders.remove("X-User-Id");
+    httpHeaders.remove("X-Username");
+    httpHeaders.remove("X-Roles");
+    ```
+  - Re-injects verified identity headers **solely** from cryptographically validated JWT claims (`subject`, `userId`, `roles`).
+  - Sets `exchange.getAttributes().put("userId", userId)` so downstream filters consume trusted server-side state.
+
+#### 2. Defense-in-Depth Path Protection & Admin RBAC
+- **The Problem Solved**: Sub-path prefix spoofing or forgotten role checks on internal administration routes.
+- **Implementation**:
+  - Public routes (`/auth/v1/login`, `/auth/v1/signup`, `/auth/v1/refreshToken`, `/auth/v1/forgot-password`, `/auth/v1/reset-password`) are strictly evaluated using exact collection lookup (`PUBLIC.contains(path)`), preventing prefix-matching bypasses.
+  - Defense-in-depth admin protection checks `path.contains("/admin")` and enforces `ROLE_ADMIN` membership, guarding admin endpoints across all microservices (Auth and User services) before requests ever reach internal controllers.
+
+#### 3. Attribute-Driven Distributed Rate Limiting (`UserKeyResolver`)
+- **The Problem Solved**: Header-based rate limiting allows attackers to spoof client headers or IPs to exhaust other users' quotas.
+- **Implementation**:
+  - `UserKeyResolver` extracts the rate-limiting key directly from server-side `exchange.getAttribute("userId")`.
+  - Authenticated traffic is keyed as `user:{userId}`, ensuring strict per-user rate quotas regardless of proxy hops or IP rotation.
+  - Unauthenticated public endpoints (e.g. login/signup) fall back to client IP (`exchange.getRequest().getRemoteAddress()`), guarded with null-safety defaults (`"unknown-client"`).
+
+#### 4. Multi-Tier Token Bucket Rate Limiting (Redis)
+- **The Problem Solved**: Different endpoint categories impose vastly different load characteristics and costs.
+- **Implementation**:
+  - **Auth Limiter (`authRateLimiter`)**: `1 req/sec`, burst `5`. Prevents credential stuffing and brute-force attacks on `/auth/**`.
+  - **Read Limiter (`readRateLimiter`)**: `10 req/sec`, burst `50`. High throughput for cached read requests (`GET` queries).
+  - **Write Limiter (`writeRateLimiter`)**: `5 req/sec`, burst `20`. Mid-tier protection for state-mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`).
+  - **AI / SMS Limiter (`aiRateLimiter`)**: `1 req/2sec`, burst `10` (token cost = 2). Strictly limits high-cost third-party LLM and SMS invocations.
+
+#### 5. Resilience4j Circuit Breaking & TimeLimiter Isolation
+- **The Problem Solved**: Cascading latency, thread exhaustion, and hung connections when a downstream microservice experiences degradation.
+- **Implementation**:
+  - Every route is wrapped with a named Resilience4j Circuit Breaker instance (`auth-service-cb`, `user-service-cb`, `expense-service-cb`, `notification-service-cb`, `ai-service-cb`).
+  - Dedicated TimeLimiter configurations: User service allows `30s` timeout for Cloudinary file uploads, while standard services timeout at `5s`.
+  - When failure rate exceeds 50% or slow calls exceed 80%, the circuit opens, redirecting requests to non-blocking fallback endpoints in `FallbackController` (`HTTP 503 Service Unavailable`).
+
+#### 6. Distributed Tracing & Response Header Propagation
+- **The Problem Solved**: Correlating client requests with downstream microservice logs in distributed environments.
+- **Implementation**:
+  - Integrated with **Micrometer Tracing** and OpenTelemetry / Zipkin.
+  - `TraceIdResponseFilter` runs with `Ordered.LOWEST_PRECEDENCE` and registers a `beforeCommit` reactive hook on the response:
+    ```java
+    exchange.getResponse().beforeCommit(() -> {
+        Span currentSpan = this.tracer.currentSpan();
+        if (currentSpan != null) {
+            exchange.getResponse().getHeaders().add("X-Trace-Id", currentSpan.context().traceId());
+        }
+        return Mono.empty();
+    });
+    ```
+  - Returns `X-Trace-Id` on all outbound responses to clients for end-to-end auditability.
+
+---
+
+### 🚦 Gateway Routing Table
+
+| Route ID | Path Pattern | HTTP Method | Rate Limiter | Circuit Breaker | Target URI |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `auth-service` | `/auth/**` | Any | `authRateLimiter` (1 rps, burst 5) | `auth-service-cb` | `lb://AUTH-SERVICE` |
+| `user-service-reads` | `/api/v1/users/**` | `GET` | `readRateLimiter` (10 rps, burst 50) | `user-service-cb` | `lb://USER-SERVICE` |
+| `user-service-writes` | `/api/v1/users/**` | `POST`, `PUT`, `PATCH`, `DELETE` | `writeRateLimiter` (5 rps, burst 20) | `user-service-cb` | `lb://USER-SERVICE` |
+| `expense-service-reads` | `/api/v1/expenses/**` | `GET` | `readRateLimiter` (10 rps, burst 50) | `expense-service-cb` | `lb://EXPENSE-SERVICE` |
+| `expense-service-writes` | `/api/v1/expenses/**` | `POST`, `PUT`, `PATCH`, `DELETE` | `writeRateLimiter` (5 rps, burst 20) | `expense-service-cb` | `lb://EXPENSE-SERVICE` |
+| `notification-service-reads` | `/api/v1/notifications/**` | `GET` | `readRateLimiter` (10 rps, burst 50) | `notification-service-cb` | `lb://NOTIFICATION-SERVICE` |
+| `notification-service` | `/api/v1/notifications/**` | `POST`, `PUT`, `PATCH`, `DELETE` | `writeRateLimiter` (5 rps, burst 20) | `notification-service-cb` | `lb://NOTIFICATION-SERVICE` |
+| `ai-service` | `/api/v1/sms/**` | Any | `aiRateLimiter` (0.5 rps, burst 10) | `ai-service-cb` | `lb://AI-SERVICE` |
+
+---
+
+### 🧪 Comprehensive Gateway Testing Suite
+
+The Gateway test suite leverages **Spring Cloud Gateway Test**, **Project Reactor StepVerifier**, and **MockServerWebExchange** for isolated reactive verification:
+
+```bash
+gateway/src/test/java/com/greatest/gateway/
+├── GatewayApplicationTests.java    # Full reactive Spring context bootstrap validation
+├── JwtAuthFilterTest.java          # Reactive WebFlux filter verification (StepVerifier):
+│                                   #  - Public path pass-through
+│                                   #  - Missing token 401 Unauthorized rejection
+│                                   #  - Non-admin 403 Forbidden rejection
+│                                   #  - Header spoofing cleansing & verified claims injection
+├── JwtUtilTest.java                # HMAC-SHA256 signature validation, expiry checks & required claims assertions
+└── UserKeyResolverTest.java        # Server attribute resolution, client IP fallback & null-safety validation
+```
+
+#### Running Gateway Tests:
+```bash
+# Run all gateway tests
+cd gateway
+.\mvnw.cmd test
+
+# Run a clean build and test run
+.\mvnw.cmd clean test
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | HTTP Port for Gateway | `8080` |
+| `REDIS_HOST` | Redis Server Hostname | `localhost` |
+| `REDIS_PORT` | Redis Server Port | `6379` |
+| `EUREKA_URI` | Service Discovery Server URI | `http://localhost:8761/eureka/` |
+| `JWT_SECRET` | Base64-encoded HMAC-SHA256 Secret (>= 256 bits) | - |
+| `JWT_EXPIRATION` | Access Token Expiration (ms) | `3600000` (1 hour) |
+| `JWT_REFRESH_EXPIRATION` | Refresh Token Expiration (ms) | `604800000` (7 days) |
+| `ZIPKIN_ENDPOINT` | Distributed Tracing OTLP / Zipkin Ingestion | `http://localhost:9411/api/v2/spans` |
+
+---
+
+## 💰 Expense Service (`expenseService`)
+
+The **Expense Service** manages transaction lifecycles, categorized spending records, monthly category budgets, automated budget threshold alerts, and multi-dimensional financial aggregations. It enforces strict per-user idempotency, optimistic concurrency locking, distributed multi-instance outbox leasing, and poison-pill resilient event consumption.
+
+---
+
+### 🏛️ Architectural Overview & Distributed Patterns
+
+```mermaid
+graph TD
+    subgraph Client / Gateway
+        Client([HTTP Client / Gateway])
+    end
+
+    subgraph Expense Service
+        Controller[ExpenseController]
+        Service[ExpenseService]
+        BudgetSvc[BudgetService / BudgetAlertService]
+        OutboxPoller[OutboxPoller<br/>Scheduled Worker]
+        OutboxClaim[OutboxClaimService<br/>FOR UPDATE SKIP LOCKED]
+        Publisher[OutboxEventPublisher]
+        ExpenseConsumer[ExpenseConsumer<br/>expense.create.request]
+        UserConsumer[UserDeletedConsumer<br/>user.deleted]
+        DltConsumer[ExpenseDltConsumer<br/>StringDeserializer]
+    end
+
+    subgraph Persistence Layer
+        DB[(PostgreSQL 16<br/>Flyway Managed)]
+    end
+
+    subgraph Messaging Layer
+        TopicCreated[[expense.created]]
+        TopicAlert[[budget-alerts]]
+        TopicRequest[[expense.create.request]]
+        TopicDeleted[[user.deleted]]
+        DltTopics[[*.DLT Topics]]
+    end
+
+    Client -->|JWT Authenticated REST| Controller
+    Controller --> Service
+    Controller --> BudgetSvc
+
+    Service -->|Save Expense & Atomic Outbox Event| DB
+    Service --> BudgetSvc
+    BudgetSvc -->|Check Threshold & Save BUDGET_ALERT Outbox| DB
+
+    OutboxPoller --> OutboxClaim
+    OutboxClaim -->|Atomic Claim: FOR UPDATE SKIP LOCKED| DB
+    OutboxPoller --> Publisher
+    Publisher -->|Publish Event| TopicCreated
+    Publisher -->|Publish Alert| TopicAlert
+
+    TopicRequest --> ExpenseConsumer
+    ExpenseConsumer -->|Idempotent Ingestion by externalId| Service
+
+    TopicDeleted --> UserConsumer
+    UserConsumer -->|Cascading Purge expenses & budgets| DB
+
+    TopicRequest -.->|Corrupt / Failed| DltTopics
+    TopicDeleted -.->|Corrupt / Failed| DltTopics
+    DltTopics --> DltConsumer
+    DltConsumer -->|Persist raw payload & stacktrace| DB
+```
+
+---
+
+### 🛡️ Core Engineering Highlights & Resiliency Patterns
+
+#### 1. Multi-Instance Safe Transactional Outbox (`FOR UPDATE SKIP LOCKED`)
+- **The Problem Solved**: The dual-write problem during financial transaction creation. If the database commit succeeds but publishing to Kafka fails (or vice versa), state drifts across services. Furthermore, running multiple replicas of `expense-service` risks duplicate publishes without distributed coordination.
+- **Implementation**:
+  - Every expense creation or budget alert threshold trigger atomically saves an `OutboxEvent` (`status = PENDING`, `next_retry_at = NOW()`) inside the **exact same ACID database transaction** as the domain entity.
+  - Dedicated background leasing service (`OutboxClaimService`) uses PostgreSQL native row-level locking:
+    ```sql
+    SELECT * FROM outbox_events
+    WHERE (status = 'PENDING' AND next_retry_at <= :now)
+       OR (status = 'PROCESSING' AND locked_until <= :now)
+    ORDER BY created_at ASC
+    LIMIT :limit
+    FOR UPDATE SKIP LOCKED
+    ```
+  - **Dead Worker Recovery**: If a worker crashes mid-publish, other instances automatically reclaim expired leases (`status = 'PROCESSING' AND locked_until <= :now`) after the 60-second lease window.
+  - **Exponential Backoff**: Transient Kafka failures back off exponentially (`1s, 2s, 4s...` capped at `5m`) up to 10 attempts before transitioning to `DEAD` status with truncated error logging.
+
+#### 2. DLT Poison Pill Resiliency & Raw String Ingestion
+- **The Problem Solved**: When a message on Kafka is corrupted (e.g. invalid JSON syntax), typed consumers (`JsonDeserializer`) throw deserialization exceptions inside the native Kafka client polling loop, causing infinite crash loops and partition starvation.
+- **Implementation**:
+  - `KafkaConsumerConfig` wraps all `JsonDeserializer` instances with `ErrorHandlingDeserializer`. Bad payloads are intercepted, tagged with failure headers, and passed to Spring's `DefaultErrorHandler`.
+  - Non-retryable errors (`DeserializationException`, `IllegalArgumentException`) immediately route to `.DLT` via `DeadLetterPublishingRecoverer` without wasteful retries.
+  - **Poison-Proof DLT Ingestion**: `ExpenseDltConsumer` uses a dedicated `dltKafkaListenerContainerFactory` configured with **`StringDeserializer`**. It consumes the raw payload as a plain `String` (never re-parsing JSON), preventing recursive DLT crashes, and safely persists diagnostic details to the `failed_events` table with a 1000-character safety truncation on error messages.
+
+#### 3. Client-Driven Idempotency (`externalId` & Unique Constraint)
+- **The Problem Solved**: Network timeouts causing client retries, leading to double-billing or duplicate expense records.
+- **Implementation**:
+  - The client provides a unique UUID `externalId` per transaction.
+  - PostgreSQL enforces a composite unique constraint:
+    ```sql
+    CONSTRAINT uk_user_external UNIQUE (user_id, external_id)
+    ```
+  - `ExpenseService.createExpense()` performs an idempotency lookup: if an expense already exists for `(userId, externalId)`, it returns the existing entity immediately (`HTTP 201 Created`) without re-executing budget checks or generating duplicate outbox events.
+
+#### 4. Automated Budget Alert Threshold Engine
+- **The Problem Solved**: Alert fatigue and duplicate notifications when multiple expenses occur near category limits.
+- **Implementation**:
+  - Upon every expense persistence, `BudgetAlertService` calculates current monthly expenditure against the category's configured monthly budget.
+  - Detects threshold crossings (`50%`, `80%`, `100%`).
+  - Tracks `last_alert_threshold` on the `Budget` entity. If a user spends more while remaining within the same threshold tier (e.g. 82% to 88%), redundant alert events are suppressed.
+  - When a new threshold is crossed, an atomic `BUDGET_ALERT` event is persisted to `outbox_events` for downstream push notification dispatch.
+
+#### 5. Optimistic Concurrency Control (`@Version`)
+- **The Problem Solved**: Lost updates when concurrent clients update the same expense record.
+- **Implementation**:
+  - `Expense` entity leverages Hibernate `@Version private Long version;`.
+  - Concurrent modifications trigger `ObjectOptimisticLockingFailureException`, which `GlobalExceptionHandler` intercepts and translates to a clean `HTTP 409 Conflict`.
+
+#### 6. Cascading Event-Driven Account Purge (`user.deleted`)
+- **The Problem Solved**: GDPR / data retention compliance and storage cleanup when an account is deleted in `userService`.
+- **Implementation**:
+  - `UserDeletedConsumer` consumes `user.deleted` events.
+  - `UserCleanupService` executes an atomic deletion across all `expenses` and `budget` entries belonging to the user in a single transaction.
+
+---
+
+### 🔌 REST API Specification
+
+Base Path: `/api/v1/expenses`  
+*All endpoints require Bearer JWT authentication unless noted otherwise. User identity is derived strictly from the verified security context (`authentication.getName()`).*
+
+| Method | Endpoint | Description | Query / Body Parameters |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/expenses` | Creates an expense transaction (Idempotent via `externalId`). | JSON: `ExpenseDto` (`amount`, `category`, `type`, `title`, `transactionDate`, `externalId`) |
+| `PUT` | `/api/v1/expenses` | Updates an existing expense transaction. | JSON: `ExpenseDto` (`externalId`, updated fields) |
+| `GET` | `/api/v1/expenses/{externalId}` | Fetches a specific expense transaction by external ID. | Path: `externalId` |
+| `DELETE` | `/api/v1/expenses/{externalId}` | Deletes an expense transaction (`204 No Content`). | Path: `externalId` |
+| `GET` | `/api/v1/expenses` | Paginated and filtered expense transaction history. | Params: `page`, `size`, `sortBy`, `ascending`, `category`, `type`, `minAmount`, `maxAmount`, `fromDate`, `toDate` |
+| `GET` | `/api/v1/expenses/summary` | Aggregated total income, expenditure, and net balance. | None |
+| `GET` | `/api/v1/expenses/analytics/category`| Aggregated total spending grouped by category. | None |
+| `GET` | `/api/v1/expenses/analytics/monthly` | Historical monthly expenditure breakdown. | None |
+| `POST` | `/api/v1/expenses/budgets` | Creates or updates a monthly category budget. | JSON: `BudgetDto` (`category`, `amount`, `month`, `year`) |
+| `GET` | `/api/v1/expenses/budgets/status` | Current budget utilization and remaining balance. | Params: `month` (1–12), `year` (>= 2000) |
+
+---
+
+### 🗄️ Database Schema & Flyway Migrations
+
+The database is version-controlled via Flyway:
+
+```bash
+expenseService/src/main/resources/db/migration/
+├── V1__init_expense_schema.sql         # Core schema: expenses, budget, outbox_events, processed_events, failed_events
+└── V2__outbox_add_locked_until.sql     # Multi-instance leasing: locked_until column & idx_outbox_claimable index
+```
+
+---
+
+### 🧪 Comprehensive Testing Suite
+
+The `expenseService` test suite provides multi-layered coverage across unit, slice, and integration layers:
+
+```bash
+expenseService/src/test/java/com/greatest/expenseService/
+├── ExpenseServiceApplicationTests.java # Spring Boot context bootstrap smoke test
+├── integration/
+│   └── ExpenseIntegrationTest.java     # E2E MockMvc + H2 + Outbox integration test (Creation, Idempotency, Budget Alerts)
+├── controllers/
+│   └── ExpenseControllerTest.java      # MockMvc WebMvc slice tests (Validation, Security Principal, Query Filters)
+├── services/
+│   ├── ExpenseServiceTest.java         # Domain logic, idempotency, updates, soft checks
+│   ├── BudgetServiceTest.java          # Budget limits, status computation, percentages
+│   ├── BudgetAlertServiceTest.java     # Threshold detection (50%, 80%, 100%) & suppression
+│   ├── OutboxClaimServiceTest.java     # Lease acquisition, status transitions & lock expiration
+│   └── UserCleanupServiceTest.java     # Cascading user purge
+├── producers/
+│   └── OutboxEventPublisherTest.java   # Kafka publish success, backoff calculation & DEAD transitions
+├── consumer/
+│   ├── ExpenseConsumerTest.java        # Kafka listener invocation
+│   ├── ExpenseDeserializerTest.java    # Jackson date serialization & DeserializationException handling
+│   ├── ExpenseDltConsumerTest.java     # Raw string DLT ingestion & failed_events persistence
+│   └── UserDeletedConsumerTest.java    # Account cleanup delegation
+└── repository/
+    ├── ExpenseRepositoryTest.java      # Summary projection, spending aggregation, custom specifications
+    └── BudgetRepositoryTest.java       # Category month/year composite queries
+```
+
+#### Running Expense Service Tests:
+```bash
+# Run all tests in expenseService
+cd expenseService
+.\mvnw.cmd test
+
+# Run integration tests specifically
+.\mvnw.cmd test -Dtest=ExpenseIntegrationTest
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | HTTP Port | `9810` |
+| `POSTGRES_HOST` | Database Hostname | `localhost` |
+| `POSTGRES_PORT` | Database Port | `5432` |
+| `POSTGRES_DB` | Database Name | `expenseservice` |
+| `POSTGRES_USER` | Database Username | `postgres` |
+| `POSTGRES_PASSWORD` | Database Password | - |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka Broker List | `localhost:9092` |
+| `JWT_SECRET` | Base64-encoded HMAC-SHA256 Secret (>= 256 bits) | - |
+| `EUREKA_URI` | Eureka Service Registry | `http://localhost:8761/eureka/` |
+| `ZIPKIN_ENDPOINT` | Distributed Tracing Endpoint | `http://localhost:9411/api/v2/spans` |
+
+---
+
+## 🤖 AI SMS Service (`ai-sms-service`)
+
+The **AI SMS Service** is an intelligent, high-throughput financial message classification and extraction microservice built with **Python 3.12**, **FastAPI**, and Google's **Gemini 2.5 Flash** large language model. It ingests raw financial SMS notifications from the mobile client, executes dual-path hybrid NLP parsing (structured LLM inference coupled with deterministic regex extraction), computes deterministic transaction fingerprints, and automatically dispatches high-confidence events to **Apache Kafka** for zero-friction ledger persistence in `expenseService`.
+
+---
+
+### 🏛️ Architectural Overview & Distributed Patterns
+
+```mermaid
+graph TD
+    subgraph EdgeGateway ["Client / Edge Gateway"]
+        Client(["Mobile App / React Native"])
+        Gateway["Spring Cloud Gateway<br/>Circuit Breaker: ai-service-cb<br/>Rate Limiting: Redis KeyResolver"]
+    end
+
+    subgraph AISMS ["AI SMS Service (FastAPI)"]
+        AuthDep["Auth Dependency<br/>PyJWT Base64 HMAC-SHA256"]
+        ClassifyRoute["POST /api/v1/sms/classify"]
+        GeminiClassifier["Async Gemini Classifier<br/>gemini-2.5-flash / Tenacity Retry"]
+        RegexEngine["Deterministic Regex Engine<br/>Amount, Merchant & Category Heuristics"]
+        Fingerprinter["Deterministic SHA-256 Fingerprint<br/>externalId = sms-hash"]
+        ConfidenceGate{"Confidence >= 0.85<br/>& Valid Amount?"}
+        AsyncWorker["Async ThreadPool Executor<br/>loop.run_in_executor"]
+        KafkaProducer["Resilient KafkaProducer<br/>acks=all, gzip, enable_idempotence=True"]
+        EurekaClient["Eureka Registry Client<br/>Heartbeat & Fast Shutdown Deregistration"]
+        HealthEngine["Actuator Health Engine<br/>Kafka Admin Cache & Secret Probes"]
+    end
+
+    subgraph ExternalAI ["External AI Platform"]
+        GeminiAPI[("Google GenAI API<br/>JSON Schema: SmsClassification")]
+    end
+
+    subgraph MessagingDownstream ["Messaging & Downstream Processing"]
+        KafkaTopic[["expense.create.request"]]
+        ExpenseSvc["Expense Service<br/>ExpenseConsumer & Idempotent Ledger"]
+    end
+
+    subgraph Telemetry ["Telemetry & Observability"]
+        Zipkin[("Zipkin / OTel Distributed Tracing")]
+        Prometheus[("Prometheus /metrics<br/>ai_sms_llm_failures_total")]
+        Promtail[("Promtail / Loki Log Collector")]
+    end
+
+    Client -->|"POST /api/v1/sms/classify"| Gateway
+    Gateway -->|"Verify JWT & Route lb://AI-SERVICE"| AuthDep
+    AuthDep -->|"Extract Verified userId"| ClassifyRoute
+    ClassifyRoute -->|"Non-blocking aio generate_content"| GeminiClassifier
+    GeminiClassifier <-->|"Structured JSON Schema"| GeminiAPI
+    ClassifyRoute -->|"Parallel Deterministic Extraction"| RegexEngine
+    ClassifyRoute --> Fingerprinter
+    Fingerprinter --> ConfidenceGate
+
+    ConfidenceGate -->|"Yes: Confidence >= 0.85"| AsyncWorker
+    AsyncWorker --> KafkaProducer
+    KafkaProducer -->|"Publish Key=userId"| KafkaTopic
+    KafkaTopic --> ExpenseSvc
+
+    ConfidenceGate -->|"No: Low Confidence or Irrelevant"| ClassifyRoute
+    ClassifyRoute -->|"HTTP 200: autoCreated flag & event payload"| Client
+
+    ClassifyRoute -.->|"Distributed Span Propagation"| Zipkin
+    ClassifyRoute -.->|"Metrics Collection"| Prometheus
+    EurekaClient <-->|"Heartbeats & Lifecycle"| Gateway
+    HealthEngine -.->|"Liveness & Readiness Probes"| Gateway
+```
+
+---
+
+### 🛡️ Core Engineering Highlights & Resiliency Patterns
+
+#### 1. Non-Blocking Async Event Loop with Offloaded Kafka ThreadPool Dispatch
+- **The Problem Solved**: FastAPI operates on an asynchronous `asyncio` event loop. Synchronous network I/O or blocking socket waits within route handlers freeze the loop, halting concurrent request processing and causing severe tail latencies under mobile traffic bursts.
+- **Implementation**:
+  - LLM classification utilizes Google GenAI’s native asynchronous client (`client.aio.models.generate_content`), ensuring the event loop remains free while awaiting remote model generation.
+  - While `kafka-python`’s `future.get(timeout=15)` is inherently blocking, the service bridges the async/sync boundary via `loop.run_in_executor(None, publish_expense_event, event.model_dump())`.
+  - Kafka delivery acknowledgment blocks only a dedicated threadpool worker, allowing the FastAPI event loop to concurrently serve other classification requests.
+
+#### 2. Dual-Path Hybrid Classification & Deterministic Safety Anchors
+- **The Problem Solved**: Pure LLM processing can hallucinate transaction amounts or fail on unexpected network timeouts. Conversely, pure regex parsers fail to understand complex phrasing across diverse financial institutions and SMS gateway providers.
+- **Implementation**:
+  - **Path A (LLM Semantic Reasoning)**: Gemini 2.5 Flash classifies intent (`expense`, `income`, `irrelevant`), assigns a normalized confidence score (`0.0`–`1.0`), and categorizes the transaction against a predefined domain ontology (`FOOD`, `TRANSPORT`, `SHOPPING`, `BILLS`, `ENTERTAINMENT`, `HEALTH`, `SALARY`, `FREELANCE`, `INVESTMENT`, `GIFT`, `OTHERS`) strictly enforced via Pydantic JSON schemas.
+  - **Path B (Deterministic Heuristics)**: An optimized regex engine extracts monetary amounts across Indian denomination patterns (`Rs.`, `INR`, `₹`, comma grouping), disambiguates balance alerts from actual debit/credit verbs, extracts merchant identifiers from UPI VPAs (`@ybl`, `@icici`, etc.) or positional grammar (`at`, `to`, `from`), and provides keyword-based category fallback guessing.
+  - The final entity marries LLM semantic classification with exact regex-validated monetary precision.
+
+#### 3. Graceful LLM Degradation & Exponential Backoff
+- **The Problem Solved**: External LLM rate limits (HTTP 429), provider outages (HTTP 500/503), or network latency spikes must never cause service downtime, crash endpoints, or result in HTTP 500 errors to the mobile client.
+- **Implementation**:
+  - Outbound Gemini calls are guarded by `tenacity` retry logic: `stop_after_attempt(2)`, exponential backoff (`min=1s`, `max=3s`), selectively filtering retryable exceptions (`TimeoutError`, `errors.ServerError`, HTTP `429`, `500`, `503`, `504`).
+  - Configurable hard timeout (`GEMINI_TIMEOUT_MS=5000`) prevents upstream connection starvation.
+  - On exhausted retries or timeout expiry, the engine enters **Graceful Degradation Mode**:
+    - Flags `degraded: true` in the API response.
+    - Falls back to local keyword heuristics (`guess_category`) and regex amount extraction.
+    - Increments Prometheus failure metrics (`ai_sms_llm_failures_total{reason="timeout|error"}`).
+    - Returns HTTP 200 with `autoCreated: false`, enabling the mobile app to prompt the user with pre-filled suggestions rather than failing silently.
+
+#### 4. Idempotent Transaction Fingerprinting (`externalId`)
+- **The Problem Solved**: Mobile SMS background listeners can process duplicate notifications or re-trigger sync runs, risking duplicate expense creation in the accounting ledger.
+- **Implementation**:
+  - Generates a deterministic SHA-256 transaction fingerprint:
+    $$\text{externalId} = \text{"sms-"} + \text{SHA256}(\text{userId} + \text{smsText})[0:16]$$
+  - Carried in the Kafka payload (`SmsExpenseEvent.externalId`) directly into `expenseService`.
+  - Downstream database constraints and idempotency filters detect duplicated external IDs, treating re-deliveries as idempotent no-ops.
+
+#### 5. Enterprise Kafka Producer Resiliency & Partition Affinity
+- **The Problem Solved**: Network partitions, broker rebalances, or producer restarts could lead to lost messages, out-of-order ledger updates, or broker connection thrashing.
+- **Implementation**:
+  - Configured with `acks="all"` to guarantee replication persistence across all in-sync replicas before acknowledging delivery.
+  - `enable_idempotence=True` prevents broker duplicate writes within the producer session.
+  - `retries=10`, `max_in_flight_requests_per_connection=5`, `compression_type="gzip"`, and `linger_ms=10` optimize network batching while preserving strict per-partition ordering.
+  - Sets message key to `userId`, guaranteeing that all transactions belonging to a user land on the same Kafka partition and are processed strictly in chronological order by `expenseService`.
+  - FastAPI lifespan management executes a graceful shutdown hook (`_producer.flush(timeout=10.0)` followed by `_producer.close()`), ensuring zero message drop during container rolling updates.
+
+#### 6. Gateway Circuit Breaking, Service Discovery & Observability
+- **The Problem Solved**: Slow AI responses must not cascade upstream or exhaust API Gateway Netty worker threads. Health checks must not overwhelm Kafka broker metadata.
+- **Implementation**:
+  - Integrated into Netflix Eureka service discovery (`ai-service`). Lifespan shutdown explicitly invokes `eureka_client.stop_async()` for instant gateway deregistration without waiting for the 90-second lease expiry.
+  - Protected at the API Gateway by Resilience4j circuit breaker (`ai-service-cb`) with a 15-second call timeout and automatic fallback routing to `/fallback/ai`.
+  - Exposes Spring Boot Actuator-compatible endpoints: `/actuator/health`, `/actuator/health/liveness`, `/actuator/health/readiness`.
+  - Broker health checks use a cached `KafkaAdminClient` with a 5-second TTL and 3-second connect timeout, preventing socket saturation under aggressive Kubernetes / Docker health probes.
+  - OpenTelemetry distributed tracing exports spans directly to Zipkin (`/api/v2/spans`). A custom `TraceContextFilter` automatically injects active `trace_id` and `span_id` into all application log lines (`logs/ai-service.log`) for centralized ingestion by Promtail and Grafana Loki.
+
+---
+
+### 🔌 REST API Specification
+
+Base Path: `/api/v1/sms`  
+*All endpoints require Bearer JWT authentication via the `Authorization` header. Token secret decoding matches the base64-encoded HMAC-SHA256 contract established across the microservice ecosystem.*
+
+| Method | Endpoint | Description | Query / Body Parameters |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/sms/classify` | Classifies SMS, extracts transaction details, and auto-dispatches to Kafka if confidence >= 0.85. | JSON: `SmsClassifyRequest` (`smsText`) |
+| `GET` | `/actuator/health` | Comprehensive readiness & dependency health check (Kafka broker connectivity, Gemini key, JWT secret). | None |
+| `GET` | `/actuator/health/readiness` | Alias for `/actuator/health` used by container orchestrators. | None |
+| `GET` | `/actuator/health/liveness` | Zero-dependency process liveness probe (returns HTTP 200 immediately). | None |
+| `GET` | `/metrics` | Prometheus metrics scrape endpoint (HTTP request durations, latency histograms, custom LLM counters). | None |
+
+---
+
+#### Request & Response Schemas
+
+##### 1. High-Confidence Transaction (Auto-Created & Published to Kafka)
+**Request:**
+```http
+POST /api/v1/sms/classify HTTP/1.1
+Host: gateway:8080
+Authorization: Bearer <JWT_TOKEN>
+Content-Type: application/json
+
+{
+  "smsText": "Sent Rs. 349.00 from HDFC Bank to Swiggy on 12-08-2026 via UPI. Ref 482910."
+}
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "label": "expense",
+  "confidence": 0.98,
+  "autoCreated": true,
+  "degraded": false,
+  "event": {
+    "externalId": "sms-e3b0c44298fc1c14",
+    "userId": "user-4891-uuid",
+    "amount": 349.0,
+    "currency": "INR",
+    "type": "EXPENSE",
+    "category": "FOOD",
+    "title": "Swiggy",
+    "note": "Auto-detected from SMS",
+    "transactionDate": "2026-08-12"
+  }
+}
+```
+
+##### 2. Low-Confidence or Ambiguous Transaction (Manual User Confirmation Required)
+**Response (`200 OK`):**
+```json
+{
+  "label": "expense",
+  "confidence": 0.72,
+  "autoCreated": false,
+  "degraded": false,
+  "event": {
+    "externalId": "sms-78fa23bc110a99c2",
+    "userId": "user-4891-uuid",
+    "amount": 1200.0,
+    "currency": "INR",
+    "type": "EXPENSE",
+    "category": "OTHERS",
+    "title": "SMS detected transaction",
+    "note": "Auto-detected from SMS",
+    "transactionDate": "2026-08-12"
+  }
+}
+```
+
+##### 3. Irrelevant / Non-Financial Notification (Ignored)
+**Request:**
+```json
+{
+  "smsText": "Your OTP for Aadhaar verification is 482910. Do not share this with anyone."
+}
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "label": "irrelevant",
+  "confidence": 0.99,
+  "autoCreated": false,
+  "degraded": false,
+  "event": null
+}
+```
+
+---
+
+### 🧪 Comprehensive Testing Suite
+
+The `ai-sms-service` test suite is powered by **pytest**, utilizing extensive mocking of asynchronous LLM calls, Kafka brokers, and Eureka registries to ensure deterministic, sub-second execution without external network dependencies:
+
+```bash
+ai-sms-service/tests/
+├── test_auth.py                # Base64 HMAC-SHA256 JWT validation, expired tokens, missing headers & claim extraction
+├── test_classifier.py          # Gemini prompt structuring, JSON schema validation, timeout handling & retry logic
+├── test_main_api.py            # FastAPI endpoints: /classify logic, threshold gating (0.85), health & liveness probes
+├── test_producer.py            # Kafka producer threadpool dispatch, partition keying, retries & graceful shutdown
+├── test_regex_extractor.py     # Regex accuracy: multi-format amounts, UPI VPA extraction, merchant parsing & keyword heuristics
+└── test_schemas.py             # Pydantic v2 model boundary tests: validation errors, payload size limits & constraints
+```
+
+#### Running AI SMS Service Tests:
+```bash
+# Navigate to service directory
+cd ai-sms-service
+
+# Activate Python virtual environment
+source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+
+# Run all test suites with verbose output
+pytest -v
+
+# (Optional) Run with test coverage report (requires pytest-cov: pip install pytest-cov)
+pytest --cov=app tests/
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVICE_PORT` | HTTP Port for Uvicorn server | `8000` |
+| `GEMINI_API_KEY` | Google Gemini API Key for model inference | - |
+| `GEMINI_MODEL` | Gemini model variant | `gemini-2.5-flash` |
+| `GEMINI_TIMEOUT_MS` | Maximum timeout for remote LLM inference (ms) | `5000` |
+| `JWT_SECRET` | Base64-encoded HMAC-SHA256 secret key | - |
+| `KAFKA_BOOTSTRAP_SERVERS` | Apache Kafka broker connection address | `localhost:9092` |
+| `EUREKA_URI` | Service Discovery Eureka Server URI | `http://localhost:8761/eureka/` |
+| `EUREKA_INSTANCE_HOST` | Hostname / IP announced to Eureka (useful in Docker) | Dynamic IP / hostname |
+| `ZIPKIN_ENDPOINT` | OpenTelemetry Zipkin collector span ingestion URL | `http://localhost:9411/api/v2/spans` |
+
+
+
+---
+
+## 🔔 Notification Service (`notification-service`)
+
+The **Notification Service** delivers asynchronous push notifications and manages the in-app notification center. Built on **Spring Boot 3**, **Java 21**, and **Spring WebFlux (Reactive WebClient)**, it consumes Kafka events (`budget-alerts`, `expense.created`, `user.deleted`), enforces atomic message deduplication via transactional idempotency gates, and dispatches remote push alerts to mobile devices through Expo's Push Notification Service.
+
+---
+
+### 🏛️ Architectural Overview & Distributed Patterns
+
+```mermaid
+graph TD
+    subgraph EventStreaming ["Kafka Event Streaming"]
+        TopicBudget[[budget-alerts]]
+        TopicExpense[[expense.created]]
+        TopicUserDeleted[[user.deleted]]
+    end
+
+    subgraph NotificationSvc ["Notification Service (Spring Boot 3)"]
+        Consumer[NotificationEventConsumer<br/>Idempotent Kafka Consumer]
+        UserConsumer[UserDeletedConsumer<br/>Cascade Account Cleanup]
+        IdempotencyGate{ProcessedEventRepository<br/>insertIfAbsent claim}
+        NotifService[NotificationService<br/>Persist In-App Notification]
+        Dispatcher[PushNotificationDispatcher<br/>Async Dispatcher]
+        ExpoService[ExpoPushService<br/>Reactive WebClient + Retry]
+        Controller[NotificationController<br/>In-App Feed & Token Lifecycle]
+    end
+
+    subgraph Persistence ["Persistence Layer (PostgreSQL 16)"]
+        DB[(PostgreSQL 16<br/>notificationservice)]
+    end
+
+    subgraph ExternalPush ["External Push Provider"]
+        ExpoAPI[("Expo Push API<br/>/--/api/v2/push/send")]
+    end
+
+    subgraph ClientGateway ["Client / API Gateway"]
+        MobileApp([React Native Mobile App])
+        Gateway[Spring Cloud Gateway]
+    end
+
+    TopicBudget --> Consumer
+    TopicExpense --> Consumer
+    TopicUserDeleted --> UserConsumer
+
+    Consumer --> IdempotencyGate
+    IdempotencyGate -->|Already Claimed| Skip[Acknowledge & Skip]
+    IdempotencyGate -->|Newly Claimed| NotifService
+
+    NotifService -->|Persist Notification| DB
+    NotifService --> Dispatcher
+    Dispatcher --> ExpoService
+    ExpoService -->|Non-blocking Reactive POST| ExpoAPI
+    ExpoService -.->|DeviceNotRegistered| DB
+
+    UserConsumer -->|Cascade Delete Notifications & Push Tokens| DB
+
+    MobileApp --> Gateway
+    Gateway --> Controller
+    Controller --> NotifService
+    Controller -->|Register / Unregister Token| DB
+```
+
+---
+
+### 🛡️ Core Engineering Highlights & Resiliency Patterns
+
+#### 1. Zero-Message-Loss Atomic Consumer Idempotency (`insertIfAbsent`)
+- **The Problem Solved**: Kafka provides at-least-once message delivery. Network rebalances, broker reconnections, or container restarts can deliver duplicate `budget-alerts` or `expense.created` events, risking spamming users with duplicate push alerts and phantom in-app entries.
+- **Implementation**:
+  - The consumer uses `ProcessedEventRepository.insertIfAbsent(eventId, consumerGroup, timestamp)` backed by a database unique constraint on `(event_id, consumer_group)`.
+  - The atomic claim occurs inside the consumer transaction. If duplicate events arrive concurrently, exactly one succeeds (`claimed == 1`) and the duplicate exits cleanly (`claimed == 0`) with zero row lock contention or error spam.
+
+#### 2. Non-Blocking Reactive Push Dispatcher with Exponential Backoff & Jitter
+- **The Problem Solved**: Third-party push providers (Expo API) can suffer from transient connection timeouts, HTTP 429 rate limits, or network latency spikes. Blocking synchronous HTTP client calls would starve the worker thread pool.
+- **Implementation**:
+  - Outbound push calls leverage **Spring WebFlux Reactive WebClient** running on `Schedulers.boundedElastic()`.
+  - Configured with `Retry.backoff(2, Duration.ofMillis(200)).jitter(0.5)` selectively filtering retryable network and rate-limiting exceptions (`WebClientRequestException`, HTTP 429, HTTP 5xx).
+  - Outbound requests never block servlet threads, preserving high message consumption throughput.
+
+#### 3. Self-Cleaning Stale Token Purging (`DeviceNotRegistered`)
+- **The Problem Solved**: When users uninstall the mobile app or clear application data, Expo invalidates the push token. Repeatedly pushing to dead tokens degrades delivery reputation and wastes network bandwidth.
+- **Implementation**:
+  - `ExpoPushService` parses individual ticket receipts from Expo’s batch response.
+  - If a ticket reports status `error` with code `DeviceNotRegistered`, the service immediately purges the corresponding token from `push_tokens` in PostgreSQL.
+
+#### 4. Masked PII Logging & Secure Auditability
+- **The Problem Solved**: Push notification tokens and phone identifiers must not leak into centralized logs (Loki / Zipkin) in plaintext.
+- **Implementation**:
+  - Automatic string masking (`mask(token)`) renders `ExponentPushToken[AbC123XyZ]` safely as `ExponentPushToken[AbC1...]]` in log traces.
+
+#### 5. Cascading Relational Event-Driven Cleanup (`user.deleted`)
+- **The Problem Solved**: Complying with data privacy regulations (GDPR / right-to-be-forgotten) upon account deletion.
+- **Implementation**:
+  - `UserDeletedConsumer` consumes `user.deleted` and executes an atomic cascading purge of all user notifications and registered push tokens in a single transaction.
+
+---
+
+### 🔌 REST API Specification
+
+Base Path: `/api/v1/notifications`  
+*All endpoints require Bearer JWT authentication. User identity is derived strictly from the verified security context (`authentication.getName()`).*
+
+| Method | Endpoint | Description | Query / Body Parameters |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/notifications/register-token` | Upserts mobile device Expo push notification token. | JSON: `RegisterTokenRequest` (`expoToken`) |
+| `GET` | `/api/v1/notifications` | Paginated in-app notification inbox (newest first). | Query: `page` (0-indexed, default 0), `size` (default 20, max 50) |
+| `PATCH` | `/api/v1/notifications/{id}/read` | Marks a specific notification as read. | Path: `id` (UUID) |
+| `GET` | `/api/v1/notifications/unread-count` | Returns integer count of unread notifications for badge icon. | None |
+| `DELETE`| `/api/v1/notifications/token` | Unregisters push token on user logout. | None |
+
+---
+
+### 🗄️ Database Schema & Flyway Migrations
+
+The database is version-controlled via Flyway (`V1__init_notification_schema.sql`):
+
+- **`notifications` Table**: Stores in-app notification records with partial composite index `idx_notifications_user_unread ON notifications(user_id) WHERE is_read = FALSE` for ultra-fast unread badge queries.
+- **`push_tokens` Table**: Stores device Expo tokens mapped uniquely to `user_id`.
+- **`processed_events` Table**: Tracks processed event IDs scoped by `consumer_group` for guaranteed consumer idempotency.
+
+---
+
+### 🧪 Comprehensive Testing Suite
+
+The `notification-service` includes unit, repository slice (`@DataJpaTest`), and mock consumer test suites:
+
+```bash
+notification-service/src/test/java/com/greatest/notification_service/
+├── consumers/
+│   ├── NotificationEventConsumerTest.java   # Idempotent processing of budget alerts & expense events
+│   └── UserDeletedConsumerTest.java         # Cascading account purge on user.deleted
+├── controllers/
+│   └── NotificationControllerTest.java      # Paginated inbox, unread counts & token lifecycle
+├── repositories/
+│   ├── NotificationRepositoryTest.java      # @DataJpaTest with H2: partial unread index verification
+│   └── PushTokenRepositoryTest.java         # Unique user token mapping assertions
+└── services/
+    ├── ExpoPushServiceTest.java             # Reactive WebClient mock with DeviceNotRegistered purge
+    ├── NotificationServiceTest.java         # Persistence, pagination & read state mutations
+    └── PushTokenServiceTest.java            # Upsert & deduplication logic
+```
+
+#### Running Notification Service Tests:
+```bash
+# Navigate to service directory
+cd notification-service
+
+# Run all tests (Windows: .\mvnw.cmd test)
+./mvnw test
+```
+
+---
+
+### ⚙️ Environment Variables & Configuration
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | HTTP Port | `9500` |
+| `POSTGRES_HOST` | PostgreSQL Hostname | `postgres-service` / `localhost` |
+| `POSTGRES_PORT` | PostgreSQL Port | `5432` |
+| `POSTGRES_DB` | Database Name | `notificationservice` |
+| `POSTGRES_USER` | Database Username | `postgres` |
+| `POSTGRES_PASSWORD` | Database Password | - |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka Broker addresses | `kafka-service:9092` / `localhost:9092` |
+| `JWT_SECRET` | Base64-encoded HMAC-SHA256 Secret (>= 256 bits) | - |
+| `EUREKA_URI` | Service Discovery Server URI | `http://service-discovery:8761/eureka/` |
+| `ZIPKIN_ENDPOINT` | Distributed Tracing Ingestion Endpoint | `http://localhost:9411/api/v2/spans` |
+
+---
+
+## ☸️ Cloud-Native Kubernetes Orchestration (`k8s`)
+
+The entire FinTrack platform is designed for enterprise deployment across local development clusters (Docker Desktop / Minikube / Kind) and production cloud platforms (AWS EKS / GCP GKE).
+
+---
+
+### 🏛️ Kubernetes Service Topology & Architecture
+
+```mermaid
+graph TB
+    subgraph IngressEdge ["Edge Routing & Ingress"]
+        Client(["External Clients / Mobile App"]) --> GatewaySvc["Service: gateway<br/>type: LoadBalancer (:8080)"]
+    end
+
+    subgraph PodMesh ["Namespace: expense-tracker"]
+        GatewayPod["gateway-deployment<br/>Spring Cloud Gateway"]
+        
+        AuthPod["auth-service-deployment (:9898)"]
+        UserPod["user-service-deployment (:9001)"]
+        ExpensePod["expense-service-deployment (:9810)<br/>Autoscaled via HPA (1 to 5 pods)"]
+        NotifPod["notification-service-deployment (:9500)"]
+        AIPod["ai-sms-service-deployment (:8000)"]
+        EurekaPod["service-discovery-deployment (:8761)"]
+        
+        KafkaPod["kafka-deployment (:9092)"]
+        ZooPod["zookeeper-deployment (:2181)"]
+        RedisPod["redis-deployment (:6379)"]
+        PostgresPod["postgres-deployment (:5432)"]
+    end
+
+    subgraph StorageTier ["Kubernetes Persistent Volumes"]
+        PostgresPVC[("PersistentVolumeClaim<br/>postgres-pvc (10Gi)")]
+        InitSQL["ConfigMap: postgres-init-script<br/>Auto-creates 4 microservice DBs"]
+    end
+
+    subgraph ConfigAndSecrets ["Cluster Configurations"]
+        ConfigMap["ConfigMap: microservice-config<br/>DNS Endpoints & Active Profiles"]
+        ClusterSecret["Secret: microservice-secrets<br/>Injected dynamically from .env"]
+    end
+
+    GatewaySvc --> GatewayPod
+    GatewayPod --> AuthPod & UserPod & ExpensePod & NotifPod & AIPod
+
+    AuthPod & UserPod & ExpensePod & NotifPod --> PostgresPod
+    PostgresPod --- PostgresPVC
+    PostgresPod --- InitSQL
+
+    UserPod & GatewayPod --> RedisPod
+    AuthPod & UserPod & ExpensePod & AIPod --> KafkaPod
+    KafkaPod --- ZooPod
+    KafkaPod --> ExpensePod & NotifPod & AuthPod
+
+    AuthPod & UserPod & ExpensePod & NotifPod & AIPod & GatewayPod <--> EurekaPod
+
+    ConfigMap -.-> PodMesh
+    ClusterSecret -.-> PodMesh
+```
+
+---
+
+### 🛡️ Core Production Engineering Highlights
+
+#### 1. Zero-Secret GitOps Ingestion
+- **The Problem Solved**: Hardcoding database passwords, JWT signing keys, or third-party API credentials into version-controlled YAML files creates severe security vulnerabilities.
+- **Implementation**:
+  - Non-sensitive DNS network endpoints (`POSTGRES_HOST: postgres-service`, `KAFKA_BOOTSTRAP_SERVERS: kafka-service:9092`, `EUREKA_URI: http://service-discovery:8761/eureka/`) reside cleanly in `04-config.yaml`.
+  - Sensitive credentials (`JWT_SECRET`, `POSTGRES_PASSWORD`, `GEMINI_API_KEY`, `BREVO_API_KEY`, `CLOUDINARY_*`) are injected dynamically from your local `.env` file directly into cluster memory:
+    ```bash
+    kubectl create secret generic microservice-secrets --from-env-file=.env -n expense-tracker --dry-run=client -o yaml | kubectl apply -f -
+    ```
+  - Eliminates plaintext secrets from Git repositories while adhering to 12-factor application standards.
+
+#### 2. Resolving JVM Cold-Start "Death Spirals" via Tuned Probes
+- **The Problem Solved**: Java 21 / Spring Boot 3 applications require intensive CPU during JVM classloading, annotation scanning, Flyway migrations, and Eureka registration (~60–90 seconds under local containerized constraints). Overly aggressive default liveness probes (e.g. 30s) interpret warming-up containers as dead, triggering infinite SIGKILL (Exit code 137 / 143) restart loops.
+- **Implementation**:
+  - Configured with `initialDelaySeconds: 90`, `periodSeconds: 15`, and `failureThreshold: 5` across all Spring Boot deployments.
+  - Ensures Kubernetes waits for complete Spring context initialization before activating health-check supervisors.
+
+#### 3. Dynamic Horizontal Pod Autoscaling (`HorizontalPodAutoscaler`)
+- **The Problem Solved**: Month-end financial notification spikes or bursts of SMS classifications overwhelm single container instances.
+- **Implementation**:
+  - Configured `11-expense-hpa.yaml` targeting `expense-service-deployment` with CPU utilization threshold of 70%.
+  - Automatically scales replicas from **1 pod to 5 pods** under heavy load and downscales gracefully during idle periods.
+  - Paired with PostgreSQL `SELECT FOR UPDATE SKIP LOCKED` so all scaled pods lease distinct outbox events concurrently without duplicate execution.
+
+#### 4. Automatic Multi-Database Provisioning via ConfigMap Mounting
+- **The Problem Solved**: Standard PostgreSQL container images only create a single database on startup (`POSTGRES_DB`), whereas this distributed microservices ecosystem requires dedicated schemas (`authservice`, `userservice`, `expenseservice`, `notificationservice`).
+- **Implementation**:
+  - Created `postgres-init-script` ConfigMap containing `init.sql` mounted into `/docker-entrypoint-initdb.d/init.sql`.
+  - Automatically executes on volume initialization to provision all isolated schemas on a single persistent storage claim (`postgres-pvc`).
+
+---
+
+### 📂 Manifest Inventory (`k8s/`)
+
+| File | Resource Kind | Description |
+| :--- | :--- | :--- |
+| `00-service-discovery.yaml` | Deployment, Service | Netflix Eureka Service Registry (`:8761`). |
+| `01-postgres.yaml` | Deployment, Service, PVC, ConfigMap | PostgreSQL 15 database engine with 10Gi persistent storage and automated multi-database initialization. |
+| `02-redis.yaml` | Deployment, Service | Redis 7 in-memory cache and distributed lock store (`:6379`). |
+| `03-kafka.yaml` | Deployment, Service | Apache Kafka event streaming broker (`:9092`) and Apache ZooKeeper (`:2181`). |
+| `04-config.yaml` | ConfigMap | Cluster-wide DNS networking configuration (`microservice-config`). |
+| `05-expense-service.yaml` | Deployment, Service | Core financial ledger service (`:9810`) with tuned liveness/readiness probes. |
+| `06-auth-service.yaml` | Deployment, Service | Authentication and cryptographic token rotation service (`:9898`). |
+| `07-user-service.yaml` | Deployment, Service | User identity and profile service (`:9001`) with Redisson locking. |
+| `08-notification-service.yaml` | Deployment, Service | Asynchronous push notification and in-app feed service (`:9500`). |
+| `09-ai-sms-service.yaml` | Deployment, Service | FastAPI Gemini 2.5 Flash SMS classification engine (`:8000`). |
+| `10-gateway.yaml` | Deployment, Service | Spring Cloud Gateway edge perimeter with `type: LoadBalancer` (`:8080`). |
+| `11-expense-hpa.yaml` | HorizontalPodAutoscaler | Autoscaling engine scaling ledger replicas (1–5 pods) based on CPU load. |
+
+---
+
+### 🚀 Local Kubernetes Deployment Guide
+
+```bash
+# 1. Start Docker Desktop and ensure Kubernetes is enabled (green indicator)
+
+# 2. Build local container images (into Docker Desktop engine)
+docker build -t expensetracker-service-discovery:latest ./service-discovery
+docker build -t expensetracker-auth-service:latest ./AuthService1
+docker build -t expensetracker-user-service:latest ./userService
+docker build -t expensetracker-expense-service:latest ./expenseService
+docker build -t expensetracker-notification-service:latest ./notification-service
+docker build -t expensetracker-ai-sms-service:latest ./ai-sms-service
+docker build -t expensetracker-gateway:latest ./gateway
+
+# 3. Create cluster namespace
+kubectl create namespace expense-tracker
+
+# 4. Inject secrets dynamically (Zero-Secret GitOps hygiene)
+# Note: Ensure .env does not contain host overrides like POSTGRES_HOST=localhost (which would override microservice-config)
+kubectl create secret generic microservice-secrets --from-env-file=.env -n expense-tracker --dry-run=client -o yaml | kubectl apply -f -
+
+# 5. Apply all manifests
+kubectl apply -f k8s/
+
+# 6. Monitor pod startup until all pods report 1/1 Running
+kubectl get pods -n expense-tracker -w
+
+# 7. Test edge gateway health on host machine
+curl http://localhost:8080/auth/v1/health
+```

@@ -1,0 +1,111 @@
+spring:
+  reactor:
+    context-propagation: auto
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      server:
+        webflux:
+          discovery:
+            locator:
+              enabled: false
+              lowerCaseServiceId: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+server:
+  port: 8080
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://localhost:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+
+  endpoint:
+    health:
+      show-details: when-authorized
+    gateway:
+      access: read_only
+  health:
+    circuitbreakers:
+      enabled: true
+
+  tracing:
+    enabled: true
+    sampling:
+      probability: 1.0
+
+  otlp:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
+logging:
+  level:
+    root: INFO
+    com.greatest.gateway: INFO
+    org.springframework.cloud.gateway: DEBUG
+#    org.springframework.data.redis: DEBUG
+#    io.lettuce.core: DEBUG
+#    org.springframework.cloud.gateway.filter.ratelimit: TRACE
+
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: ${JWT_EXPIRATION:3600000}
+  refresh-expiration: ${JWT_REFRESH_EXPIRATION:604800000}
+
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        slow-call-duration-threshold: 3s
+        slow-call-rate-threshold: 80
+        register-health-indicator: true
+
+    instances:
+      expense-service-cb:
+        base-config: default
+      auth-service-cb:
+        base-config: default
+      user-service-cb:
+        base-config: default
+        slow-call-duration-threshold: 30s   # so a 7s upload isn't flagged "slow"
+      notification-service-cb:
+        base-config: default
+      ai-service-cb:
+        base-config: default
+        slow-call-duration-threshold: 15s
+
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 5s
+    instances:
+      user-service-cb:
+        timeout-duration: 30s        # ← this is the one that was missing
+      ai-service-cb:
+        timeout-duration: 20s

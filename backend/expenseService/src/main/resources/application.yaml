@@ -1,0 +1,106 @@
+jwt:
+  secret: ${JWT_SECRET}
+
+spring:
+  application:
+    name: expense-service
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 0
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:expenseservice}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+
+  jpa:
+    show-sql: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: false
+
+  kafka:
+    producer:
+      observation-enabled: true
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    topic-budget-alert:
+      name: budget-alerts
+    topic-user-deleted:
+      name: user.deleted
+    topic-expense-created:
+      name: expense.created
+    topic-expense-create-request:
+      name: expense.create.request
+
+    consumer:
+      group-id: expenseService-group
+      auto-offset-reset: earliest
+
+    admin:
+      auto-create: true
+
+
+    template:
+      observation-enabled: true
+    listener:
+      observation-enabled: true
+
+server:
+  port: 9810
+
+logging:
+  level:
+    com.greatest.expenseService: INFO
+    org.springframework.web: INFO
+    org.hibernate.SQL: INFO
+    org.springframework.kafka: INFO
+    io.micrometer.tracing: INFO
+
+
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://localhost:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+
+springdoc:
+  api-docs:
+    path: /api-docs
+
+  swagger-ui:
+    path: /swagger-ui
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    enabled: true
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    metrics:
+      export:
+        enabled: false
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
+
