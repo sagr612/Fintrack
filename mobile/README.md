@@ -111,21 +111,21 @@ sequenceDiagram
     end
 
     DualListener->>DualListener: SHA-256 Hash Deduplication Check
-    DualListener->>AISvc: POST /api/v1/sms/classify { sender, body, timestamp }
+    DualListener->>AISvc: POST /api/v1/sms/classify (sender, body, timestamp)
     
     AISvc->>AISvc: Gemini 2.5 Flash + Regex Extraction
-    AISvc->>AISvc: Calculate Confidence (>= 0.85) & Fingerprint
+    AISvc->>AISvc: Calculate Confidence and Fingerprint
     AISvc->>Kafka: Publish to expense.create.request
-    AISvc-->>DualListener: HTTP 200 { autoCreated: true, expense: {...} }
+    AISvc-->>DualListener: HTTP 200 (autoCreated true, expense event)
 
     Kafka->>ExpenseSvc: Ingest expense.create.request
-    ExpenseSvc->>ExpenseSvc: Persist Expense in PostgreSQL & Stage Outbox Event
-    ExpenseSvc->>Kafka: Publish expense.created & budget-alerts
+    ExpenseSvc->>ExpenseSvc: Persist Expense in PostgreSQL and Stage Outbox Event
+    ExpenseSvc->>Kafka: Publish expense.created and budget-alerts
     
     Kafka->>NotifSvc: Ingest Event
     NotifSvc->>NotifSvc: Save In-App Notification
-    NotifSvc->>App: Expo Push Notification ("Expense Recorded: ₹XX.XX spent on Food")
-    App->>App: Refresh Dashboard Summary & Play Notification Sound
+    NotifSvc->>App: Expo Push Notification (Expense Recorded on Food)
+    App->>App: Refresh Dashboard Summary and Play Notification Sound
 ```
 
 ---

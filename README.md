@@ -55,7 +55,12 @@ graph TB
     KafkaBroker -.-> KafkaDLT
     KafkaBroker --> ExpenseSvc & NotifSvc & AuthSvc
 
-    AuthSvc & UserSvc & ExpenseSvc & NotifSvc & AISvc & Gateway <--> Registry
+    Gateway <--> Registry
+    AuthSvc <--> Registry
+    UserSvc <--> Registry
+    ExpenseSvc <--> Registry
+    NotifSvc <--> Registry
+    AISvc <--> Registry
 ```
 
 ---

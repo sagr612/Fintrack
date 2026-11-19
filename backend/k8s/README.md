@@ -50,7 +50,12 @@ graph TB
     KafkaPod --- ZooPod
     KafkaPod --> ExpensePod & NotifPod & AuthPod
 
-    AuthPod & UserPod & ExpensePod & NotifPod & AIPod & GatewayPod <--> EurekaPod
+    AuthPod <--> EurekaPod
+    UserPod <--> EurekaPod
+    ExpensePod <--> EurekaPod
+    NotifPod <--> EurekaPod
+    AIPod <--> EurekaPod
+    GatewayPod <--> EurekaPod
 
     ConfigMap -.-> PodMesh
     ClusterSecret -.-> PodMesh

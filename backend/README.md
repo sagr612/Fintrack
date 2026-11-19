@@ -17,45 +17,65 @@
 
 ```mermaid
 graph TB
-    subgraph ClientPerimeter ["📱 Client Layer & Edge Security"]
+    subgraph ClientPerimeter ["Client Layer and Edge Security"]
         Client(["Mobile App (React Native / Expo 54)"])
-        Gateway["Spring Cloud Gateway (:8080)<br/>• Non-blocking Netty Reverse Proxy<br/>• Inbound Anti-Spoofing Header Cleansing<br/>• Multi-Tier Redis Rate Limiting<br/>• Resilience4j Circuit Breakers & Fallbacks"]
+        Gateway["Spring Cloud Gateway (:8080)<br/>Non-blocking Netty Reverse Proxy<br/>Inbound Anti-Spoofing Header Cleansing<br/>Multi-Tier Redis Rate Limiting<br/>Resilience4j Circuit Breakers"]
     end
 
-    subgraph ServiceRegistry ["🧭 Service Discovery Tier"]
-        Eureka["Netflix Eureka Registry (:8761)<br/>Dynamic Heartbeat & Lease Management"]
+    subgraph ServiceRegistry ["Service Discovery Tier"]
+        Eureka["Netflix Eureka Registry (:8761)<br/>Dynamic Heartbeat and Lease Management"]
     end
 
-    subgraph MicroservicesTier ["⚙️ Microservices Tier (Spring Boot 3 & FastAPI)"]
-        AuthSvc["🔐 AuthService1 (:9898)<br/>OAuth2-style Token Issuer & STR<br/>Salted SHA-256 Hashed Tokens"]
-        UserSvc["👤 UserService (:9001)<br/>User Identity & Profiles<br/>Redisson Distributed Locks"]
-        ExpenseSvc["💰 ExpenseService (:9810)<br/>Financial Ledger & Budget Thresholds<br/>Autoscaled via HPA (1 to 5 pods)"]
-        NotifSvc["🔔 NotificationService (:9500)<br/>In-App Feed & Reactive WebClient<br/>Expo Push Dispatcher"]
-        AISvc["🤖 AI SMS Service (:8000)<br/>FastAPI & Gemini 2.5 Flash + Regex<br/>Deterministic SHA-256 Fingerprinting"]
+    subgraph MicroservicesTier ["Microservices Tier (Spring Boot 3 and FastAPI)"]
+        AuthSvc["AuthService1 (:9898)<br/>OAuth2-style Token Issuer and STR<br/>Salted SHA-256 Hashed Tokens"]
+        UserSvc["UserService (:9001)<br/>User Identity and Profiles<br/>Redisson Distributed Locks"]
+        ExpenseSvc["ExpenseService (:9810)<br/>Financial Ledger and Budget Thresholds<br/>Autoscaled via HPA"]
+        NotifSvc["NotificationService (:9500)<br/>In-App Feed and Reactive WebClient<br/>Expo Push Dispatcher"]
+        AISvc["AI SMS Service (:8000)<br/>FastAPI and Gemini 2.5 Flash + Regex<br/>Deterministic SHA-256 Fingerprinting"]
     end
 
-    subgraph MessagingBackbone ["📨 Event Streaming & Resilience (Kafka)"]
+    subgraph MessagingBackbone ["Event Streaming and Resilience"]
         KafkaBroker[["Apache Kafka Broker (:9092)<br/>Topics: user.events | expense.create.request<br/>expense.created | budget-alerts | user.deleted"]]
         KafkaDLT[["Dead Letter Topics (*.DLT)<br/>Poison Pill Isolation via Raw String Consumers"]]
         ZooKeeper[["Apache ZooKeeper (:2181)"]]
     end
 
-    subgraph PersistenceCluster ["💾 Relational & Cache Storage"]
+    subgraph PersistenceCluster ["Relational and Cache Storage"]
         Postgres[("PostgreSQL 16 (:5432)<br/>Dedicated Schemas: authservice | userservice<br/>expenseservice | notificationservice")]
-        RedisStore[("Redis 7 (:6379)<br/>Distributed Locks & Rate Limit Quotas")]
+        RedisStore[("Redis 7 (:6379)<br/>Distributed Locks and Rate Limit Quotas")]
     end
 
     Client -->|"HTTPS / REST"| Gateway
     Gateway <--> Eureka
-    MicroservicesTier <--> Eureka
+    AuthSvc <--> Eureka
+    UserSvc <--> Eureka
+    ExpenseSvc <--> Eureka
+    NotifSvc <--> Eureka
+    AISvc <--> Eureka
 
-    Gateway --> AuthSvc & UserSvc & ExpenseSvc & NotifSvc & AISvc
+    Gateway --> AuthSvc
+    Gateway --> UserSvc
+    Gateway --> ExpenseSvc
+    Gateway --> NotifSvc
+    Gateway --> AISvc
 
-    AuthSvc & UserSvc & ExpenseSvc & NotifSvc --> Postgres
-    UserSvc & Gateway --> RedisStore
-    AuthSvc & UserSvc & ExpenseSvc & AISvc --> KafkaBroker
+    AuthSvc --> Postgres
+    UserSvc --> Postgres
+    ExpenseSvc --> Postgres
+    NotifSvc --> Postgres
+
+    UserSvc --> RedisStore
+    Gateway --> RedisStore
+
+    AuthSvc --> KafkaBroker
+    UserSvc --> KafkaBroker
+    ExpenseSvc --> KafkaBroker
+    AISvc --> KafkaBroker
+
     KafkaBroker -.-> KafkaDLT
-    KafkaBroker --> ExpenseSvc & NotifSvc & AuthSvc
+    KafkaBroker --> ExpenseSvc
+    KafkaBroker --> NotifSvc
+    KafkaBroker --> AuthSvc
     KafkaBroker --- ZooKeeper
 ```
 
@@ -87,29 +107,29 @@ This pipeline illustrates how an incoming bank transaction SMS on a mobile devic
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Bank as Banking / UPI Gateway
-    participant Mobile as FinTrack Mobile Client
-    participant Gateway as API Gateway (:8080)
-    participant AISvc as AI SMS Service (:8000)
-    participant Kafka as Apache Kafka Broker
-    participant ExpenseSvc as Expense Service (:9810)
-    participant NotifSvc as Notification Service (:9500)
-    participant Expo as Expo Push Server
+    actor Bank as "Banking / UPI Gateway"
+    participant Mobile as "FinTrack Mobile Client"
+    participant Gateway as "API Gateway (:8080)"
+    participant AISvc as "AI SMS Service (:8000)"
+    participant Kafka as "Apache Kafka Broker"
+    participant ExpenseSvc as "Expense Service (:9810)"
+    participant NotifSvc as "Notification Service (:9500)"
+    participant Expo as "Expo Push Server"
 
     Bank->>Mobile: SMS received ("Rs. 450 debited at Starbucks")
     Mobile->>Gateway: POST /api/v1/sms/classify { smsText }
-    Gateway->>Gateway: Strip headers & Inject verified X-User-Id
+    Gateway->>Gateway: Strip headers and Inject verified X-User-Id
     Gateway->>AISvc: Route to lb://AI-SERVICE
     
     par Dual-Path Hybrid Inference
-        AISvc->>AISvc: Gemini 2.5 Flash classifies intent & category (FOOD, conf: 0.98)
+        AISvc->>AISvc: Gemini 2.5 Flash classifies intent and category (FOOD)
     and
-        AISvc->>AISvc: Regex extracts exact amount (450.00) & merchant ("Starbucks")
+        AISvc->>AISvc: Regex extracts exact amount 450.00 and merchant Starbucks
     end
 
     AISvc->>AISvc: Generate externalId: sms-sha256(userId + text)
     AISvc->>Kafka: Publish to expense.create.request (key=userId)
-    AISvc-->>Gateway: 200 OK { autoCreated: true, externalId }
+    AISvc-->>Gateway: 200 OK (autoCreated true, externalId)
     Gateway-->>Mobile: Display pending confirmation snackbar
 
     Kafka->>ExpenseSvc: Ingest expense.create.request
@@ -118,10 +138,10 @@ sequenceDiagram
         ExpenseSvc->>ExpenseSvc: Verify idempotency by (userId, externalId)
         ExpenseSvc->>ExpenseSvc: Persist Expense entity (@Version optimistic lock)
         ExpenseSvc->>ExpenseSvc: Calculate monthly category budget consumption
-        ExpenseSvc->>ExpenseSvc: Stage EXPENSE_CREATED & BUDGET_ALERT outbox events
+        ExpenseSvc->>ExpenseSvc: Stage EXPENSE_CREATED and BUDGET_ALERT outbox events
     end
 
-    ExpenseSvc->>Kafka: Outbox worker leases (SKIP LOCKED) & publishes budget-alerts
+    ExpenseSvc->>Kafka: Outbox worker leases SKIP LOCKED and publishes budget-alerts
     Kafka->>NotifSvc: Ingest budget-alerts
     NotifSvc->>NotifSvc: Atomic idempotency gate (insertIfAbsent)
     NotifSvc->>NotifSvc: Persist in-app notification record
@@ -138,26 +158,26 @@ Prevents token replay attacks, session hijacking, and double-spend race conditio
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as Mobile Client (Axios Interceptor)
-    participant Gateway as API Gateway
-    participant AuthSvc as AuthService1 (:9898)
-    participant DB as PostgreSQL (authservice)
+    participant Client as "Mobile Client (Axios Interceptor)"
+    participant Gateway as "API Gateway"
+    participant AuthSvc as "AuthService1 (:9898)"
+    participant DB as "PostgreSQL (authservice)"
 
     Client->>Gateway: POST /api/v1/expenses (with expired access token)
     Gateway-->>Client: 401 Unauthorized
-    Note over Client: Axios Interceptor activates mutex & queues pending requests
-    Client->>Gateway: POST /auth/v1/refreshToken { refreshToken }
+    Note over Client: Axios Interceptor activates mutex and queues pending requests
+    Client->>Gateway: POST /auth/v1/refreshToken (refreshToken)
     Gateway->>AuthSvc: Forward to lb://AUTH-SERVICE
     
     AuthSvc->>AuthSvc: Compute SHA-256 hash of inbound token
-    AuthSvc->>DB: Query token by hash & verify expiry
-    alt Token Invalid or Already Revoked (Replay Attack)
+    AuthSvc->>DB: Query token by hash and verify expiry
+    alt Token Invalid or Already Revoked
         AuthSvc-->>Client: 401 Unauthorized (Trigger full logout)
-    else Token Valid & Unused
+    else Token Valid and Unused
         AuthSvc->>DB: Atomic delete old token hash
-        AuthSvc->>AuthSvc: Generate new UUID access & refresh token pair
+        AuthSvc->>AuthSvc: Generate new UUID access and refresh token pair
         AuthSvc->>DB: Save salted SHA-256 hash of new refresh token
-        AuthSvc-->>Gateway: 200 OK { newAccessToken, newRefreshToken }
+        AuthSvc-->>Gateway: 200 OK (newAccessToken, newRefreshToken)
         Gateway-->>Client: 200 OK
         Note over Client: Interceptor drains queued requests with new Bearer token
         Client->>Gateway: Replay original POST /api/v1/expenses
@@ -173,28 +193,28 @@ Guarantees 100% reliable event delivery to Apache Kafka without distributed 2PC 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant App as Service Business Logic
-    participant DB as PostgreSQL
-    participant Worker as OutboxPoller (Worker Pod)
-    participant Kafka as Apache Kafka Broker
-    participant DLT as Dead Letter Topic
+    participant App as "Service Business Logic"
+    participant DB as "PostgreSQL"
+    participant Worker as "OutboxPoller (Worker Pod)"
+    participant Kafka as "Apache Kafka Broker"
+    participant DLT as "Dead Letter Topic"
 
     rect rgb(240, 255, 240)
         Note over App,DB: Single ACID Database Transaction
         App->>DB: INSERT INTO domain_table (users / expenses)
-        App->>DB: INSERT INTO outbox_events (status='PENDING', payload=JSON)
+        App->>DB: INSERT INTO outbox_events (status PENDING)
     end
 
     loop Every 500ms (Multiple Pods in Parallel)
-        Worker->>DB: SELECT * FROM outbox_events ... FOR UPDATE SKIP LOCKED LIMIT 10
-        Note over Worker,DB: Locks disjoint row batch; zero contention across pods
+        Worker->>DB: Claim batch via FOR UPDATE SKIP LOCKED
+        Note over Worker,DB: Locks disjoint row batch without contention across pods
         Worker->>Kafka: Publish event (acks=all)
         alt Kafka Publish Success
-            Worker->>DB: UPDATE outbox_events SET status='PUBLISHED'
+            Worker->>DB: UPDATE outbox_events SET status PUBLISHED
         else Transient Kafka Failure
-            Worker->>DB: UPDATE outbox_events SET attempt_count++, next_retry_at=NOW()+backoff
+            Worker->>DB: Increment attempt_count and backoff next_retry_at
         else 10 Consecutive Failures Exhausted
-            Worker->>DB: UPDATE outbox_events SET status='DEAD', last_error=stacktrace
+            Worker->>DB: UPDATE outbox_events SET status DEAD and save error trace
         end
     end
 ```
@@ -208,19 +228,19 @@ Illustrates how deleting a user in `userService` cascades asynchronously across 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Admin as User / Admin
-    participant Gateway as API Gateway
-    participant UserSvc as UserService (:9001)
-    participant Redis as Redis (Distributed Lock)
-    participant Kafka as Apache Kafka
-    participant AuthSvc as AuthService1 (:9898)
-    participant ExpenseSvc as ExpenseService (:9810)
-    participant NotifSvc as NotificationService (:9500)
+    actor Admin as "User / Admin"
+    participant Gateway as "API Gateway"
+    participant UserSvc as "UserService (:9001)"
+    participant Redis as "Redis (Distributed Lock)"
+    participant Kafka as "Apache Kafka"
+    participant AuthSvc as "AuthService1 (:9898)"
+    participant ExpenseSvc as "ExpenseService (:9810)"
+    participant NotifSvc as "NotificationService (:9500)"
 
     Admin->>Gateway: DELETE /api/v1/users/{userId}
     Gateway->>UserSvc: lb://USER-SERVICE
     UserSvc->>Redis: Acquire lock user:lock:{userId} (5s timeout)
-    UserSvc->>UserSvc: Execute delete & stage user.deleted Outbox event
+    UserSvc->>UserSvc: Execute delete and stage user.deleted Outbox event
     UserSvc->>Redis: Release lock
     UserSvc-->>Admin: 204 No Content
 
@@ -231,10 +251,10 @@ sequenceDiagram
         AuthSvc->>AuthSvc: Idempotent purge: refresh tokens, reset tokens, credentials
     and Cascade Purge Financial Ledger
         Kafka->>ExpenseSvc: Ingest user.deleted
-        ExpenseSvc->>ExpenseSvc: Idempotent purge: all user transactions & monthly budgets
-    and Cascade Purge Push Tokens & Notifications
+        ExpenseSvc->>ExpenseSvc: Idempotent purge: all user transactions and monthly budgets
+    and Cascade Purge Push Tokens and Notifications
         Kafka->>NotifSvc: Ingest user.deleted
-        NotifSvc->>NotifSvc: Idempotent purge: in-app notifications & registered push tokens
+        NotifSvc->>NotifSvc: Idempotent purge: in-app notifications and registered push tokens
     end
 ```
 
