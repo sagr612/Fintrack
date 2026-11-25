@@ -37,6 +37,7 @@ expense_tracker/android/
 **/target/
 *.class
 *.jar
+!**/gradle/wrapper/gradle-wrapper.jar
 *.war
 *.ear
 **/src/main/resources/application-*.yaml
