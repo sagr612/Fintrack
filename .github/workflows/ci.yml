@@ -1,0 +1,81 @@
+name: FinTrack CI - Automated Test Suite
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # =========================================================================
+  # 1. Java Microservices (Parallel Matrix: Gradle & Maven)
+  # =========================================================================
+  java-services:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: "AuthService1"
+            path: "backend/AuthService1"
+            build-tool: "gradle"
+          - service: "UserService"
+            path: "backend/userService"
+            build-tool: "gradle"
+          - service: "ExpenseService"
+            path: "backend/expenseService"
+            build-tool: "maven"
+          - service: "NotificationService"
+            path: "backend/notification-service"
+            build-tool: "maven"
+          - service: "Gateway"
+            path: "backend/gateway"
+            build-tool: "maven"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: ${{ matrix.build-tool }}
+
+      - name: Run Gradle Tests
+        if: matrix.build-tool == 'gradle'
+        working-directory: ${{ matrix.path }}
+        run: |
+          chmod +x gradlew
+          ./gradlew test --info
+
+      - name: Run Maven Tests
+        if: matrix.build-tool == 'maven'
+        working-directory: ${{ matrix.path }}
+        run: |
+          chmod +x mvnw
+          ./mvnw test
+
+  # =========================================================================
+  # 2. Python AI-SMS Service
+  # =========================================================================
+  python-ai-service:
+    name: Test AI SMS Service
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies & Run Pytest
+        working-directory: backend/ai-sms-service
+        run: |
+          pip install -r requirements.txt
+          pytest -v
