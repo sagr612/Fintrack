@@ -55,7 +55,7 @@ def client_factory():
 # Health endpoint
 # ---------------------------------------------------------------------------
 
-def test_health_returns_up(client):
+def test_health_returns_up(client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "mock-test-gemini-key")
     monkeypatch.setenv("JWT_SECRET", "mock-test-jwt-secret-for-testing")
     with patch("app.main.check_kafka_health", return_value={"status": "UP"}):
