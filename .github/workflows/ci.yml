@@ -76,6 +76,9 @@ jobs:
 
       - name: Install Dependencies & Run Pytest
         working-directory: backend/ai-sms-service
+        env:
+          GEMINI_API_KEY: "mock-gemini-key-for-ci"
+          JWT_SECRET: "mock-jwt-secret-key-for-ci"
         run: |
           pip install -r requirements.txt
           pytest -v

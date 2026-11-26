@@ -1,5 +1,6 @@
 # tests/test_main_api.py
 """API endpoint tests for the ai-sms-service FastAPI app."""
+from _pytest.monkeypatch import monkeypatch
 from unittest.mock import patch, AsyncMock
 
 import pytest
@@ -55,6 +56,8 @@ def client_factory():
 # ---------------------------------------------------------------------------
 
 def test_health_returns_up(client):
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-test-gemini-key")
+    monkeypatch.setenv("JWT_SECRET", "mock-test-jwt-secret-for-testing")
     with patch("app.main.check_kafka_health", return_value={"status": "UP"}):
         response = client.get("/actuator/health")
     assert response.status_code == 200
